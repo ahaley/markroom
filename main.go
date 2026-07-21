@@ -7,10 +7,13 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 )
 
 func main() {
@@ -18,16 +21,19 @@ func main() {
 		usage()
 		os.Exit(2)
 	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	var err error
 	switch os.Args[1] {
 	case "add":
-		err = cmdAdd(os.Args[2:])
+		err = cmdAdd(ctx, os.Args[2:])
 	case "remove":
-		err = cmdRemove(os.Args[2:])
+		err = cmdRemove(ctx, os.Args[2:])
 	case "list":
-		err = cmdList()
+		err = cmdList(ctx)
 	case "serve":
-		err = cmdServe(os.Args[2:])
+		err = cmdServe(ctx, os.Args[2:])
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -57,7 +63,7 @@ To read from your phone over Tailscale:
   tailscale serve --bg http://127.0.0.1:8383`)
 }
 
-func cmdAdd(args []string) error {
+func cmdAdd(ctx context.Context, args []string) error {
 	var dir, name string
 	for i := 0; i < len(args); i++ {
 		switch {
@@ -109,7 +115,7 @@ func cmdAdd(args []string) error {
 		return err
 	}
 	defer store.Close()
-	n, err := store.ScanRoot(Root{Name: name, Path: abs})
+	n, err := store.ScanRoot(ctx, Root{Name: name, Path: abs})
 	if err != nil {
 		return err
 	}
@@ -117,7 +123,7 @@ func cmdAdd(args []string) error {
 	return nil
 }
 
-func cmdRemove(args []string) error {
+func cmdRemove(ctx context.Context, args []string) error {
 	if len(args) != 1 {
 		return fmt.Errorf("usage: markroom remove <name>")
 	}
@@ -148,14 +154,14 @@ func cmdRemove(args []string) error {
 		return err
 	}
 	defer store.Close()
-	if err := store.PurgeRoot(name); err != nil {
+	if err := store.PurgeRoot(ctx, name); err != nil {
 		return err
 	}
 	fmt.Printf("removed %q\n", name)
 	return nil
 }
 
-func cmdList() error {
+func cmdList(ctx context.Context) error {
 	cfg, err := loadConfig()
 	if err != nil {
 		return err
@@ -170,7 +176,7 @@ func cmdList() error {
 	}
 	defer store.Close()
 	for _, r := range cfg.Roots {
-		total, unread, err := store.RootStats(r.Name)
+		total, unread, err := store.RootStats(ctx, r.Name)
 		if err != nil {
 			return err
 		}

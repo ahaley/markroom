@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"html/template"
+	"log/slog"
 	"net/http"
 	"time"
 )
@@ -95,7 +96,7 @@ func renderInbox(w http.ResponseWriter, query string, docs []Doc) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	err := tpl.ExecuteTemplate(w, "inbox", inboxData{Title: "markroom", Query: query, Docs: docs})
 	if err != nil {
-		fmt.Println("markroom: render inbox:", err)
+		slog.Error("render inbox", "err", err)
 	}
 }
 
@@ -103,7 +104,7 @@ func renderDoc(w http.ResponseWriter, doc *Doc, htmlBody string) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	err := tpl.ExecuteTemplate(w, "doc", docData{Title: doc.Title + " — markroom", Doc: doc, HTML: htmlBody})
 	if err != nil {
-		fmt.Println("markroom: render doc:", err)
+		slog.Error("render doc", "err", err)
 	}
 }
 

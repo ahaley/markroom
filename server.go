@@ -2,9 +2,12 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -76,14 +79,14 @@ func (s *Server) Handler() http.Handler {
 }
 
 // reloadAndScan picks up config changes and rescans every root.
-func (s *Server) reloadAndScan() {
+func (s *Server) reloadAndScan(ctx context.Context) {
 	if fresh, err := s.reloadConfig(); err == nil {
 		s.cfg.Store(fresh)
 	}
-	s.store.ScanAll(s.cfg.Load())
+	s.store.ScanAll(ctx, s.cfg.Load())
 }
 
-func cmdServe(args []string) error {
+func cmdServe(ctx context.Context, args []string) error {
 	addr := "127.0.0.1:8383"
 	var allowHosts []string
 	for i := 0; i < len(args); i++ {
@@ -116,20 +119,45 @@ func cmdServe(args []string) error {
 	srv := NewServer(store, cfg)
 
 	fmt.Println("markroom: initial scan…")
-	store.ScanAll(cfg)
+	store.ScanAll(ctx, cfg)
 
 	// Periodic rescan keeps the index tracking whatever agents write.
 	go func() {
 		t := time.NewTicker(30 * time.Second)
 		defer t.Stop()
-		for range t.C {
-			srv.reloadAndScan()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				srv.reloadAndScan(ctx)
+			}
 		}
 	}()
 
+	httpSrv := &http.Server{
+		Addr:              addr,
+		Handler:           hostGuard(addr, allowHosts, srv.Handler()),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	errCh := make(chan error, 1)
+	go func() { errCh <- httpSrv.ListenAndServe() }()
+
 	fmt.Printf("markroom: oh, hi — reading at http://%s\n", addr)
 	fmt.Println("markroom: for your phone over Tailscale:  tailscale serve --bg http://" + addr)
-	return http.ListenAndServe(addr, hostGuard(addr, allowHosts, srv.Handler()))
+
+	select {
+	case err := <-errCh:
+		return err
+	case <-ctx.Done():
+		slog.Info("shutting down")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := httpSrv.Shutdown(shutdownCtx); err != nil && !errors.Is(err, context.DeadlineExceeded) {
+			return err
+		}
+		return nil
+	}
 }
 
 func (s *Server) handleInbox(w http.ResponseWriter, r *http.Request) {
@@ -137,9 +165,9 @@ func (s *Server) handleInbox(w http.ResponseWriter, r *http.Request) {
 	var docs []Doc
 	var err error
 	if q != "" {
-		docs, err = s.store.Search(q)
+		docs, err = s.store.Search(r.Context(), q)
 	} else {
-		docs, err = s.store.ListDocs()
+		docs, err = s.store.ListDocs(r.Context())
 	}
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -179,9 +207,9 @@ func (s *Server) handleDoc(w http.ResponseWriter, r *http.Request) {
 
 	// Index may lag the disk; upsert so what we show is what we record.
 	if info, statErr := os.Stat(full); statErr == nil {
-		_ = s.store.UpsertDoc(root.Name, rel, content, info.ModTime(), info.Size())
+		_ = s.store.UpsertDoc(r.Context(), root.Name, rel, content, info.ModTime(), info.Size())
 	}
-	doc, err := s.store.GetDoc(root.Name, rel)
+	doc, err := s.store.GetDoc(r.Context(), root.Name, rel)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -195,7 +223,7 @@ func (s *Server) handleDoc(w http.ResponseWriter, r *http.Request) {
 
 	// Opening a document is reading it.
 	sum := sha256.Sum256(content)
-	_ = s.store.MarkRead(doc.ID, hex.EncodeToString(sum[:]))
+	_ = s.store.MarkRead(r.Context(), doc.ID, hex.EncodeToString(sum[:]))
 
 	renderDoc(w, doc, buf.String())
 }
@@ -205,12 +233,12 @@ func (s *Server) handleUnread(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	doc, err := s.store.GetDoc(r.Form.Get("root"), r.Form.Get("path"))
+	doc, err := s.store.GetDoc(r.Context(), r.Form.Get("root"), r.Form.Get("path"))
 	if err != nil {
 		http.NotFound(w, r)
 		return
 	}
-	if err := s.store.MarkUnread(doc.ID); err != nil {
+	if err := s.store.MarkUnread(r.Context(), doc.ID); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -218,7 +246,7 @@ func (s *Server) handleUnread(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleRescan(w http.ResponseWriter, r *http.Request) {
-	s.reloadAndScan()
+	s.reloadAndScan(r.Context())
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 

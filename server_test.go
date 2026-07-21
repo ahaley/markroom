@@ -44,7 +44,7 @@ func TestServerEndToEnd(t *testing.T) {
 	writeFile(t, filepath.Join(dir, "spec.md"), "# The Spec\n\nhello body text")
 	writeFile(t, filepath.Join(dir, "img.png"), "not-really-a-png")
 	writeFile(t, filepath.Join(dir, "tool.exe"), "MZ")
-	srv.reloadAndScan()
+	srv.reloadAndScan(t.Context())
 
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
@@ -55,7 +55,7 @@ func TestServerEndToEnd(t *testing.T) {
 
 	// Opening the doc renders markdown and marks it read.
 	get(t, client, ts.URL+"/d/docs/spec.md", http.StatusOK, "<h1", "hello body text")
-	doc, err := srv.store.GetDoc("docs", "spec.md")
+	doc, err := srv.store.GetDoc(t.Context(), "docs", "spec.md")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -86,7 +86,7 @@ func TestServerEndToEnd(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("unread POST final status = %d, want 200", resp.StatusCode)
 	}
-	doc, _ = srv.store.GetDoc("docs", "spec.md")
+	doc, _ = srv.store.GetDoc(t.Context(), "docs", "spec.md")
 	if doc.Status != "new" {
 		t.Fatalf("after unread, status = %q, want new", doc.Status)
 	}
