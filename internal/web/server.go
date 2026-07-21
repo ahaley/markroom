@@ -1,4 +1,6 @@
-package main
+// Package web serves the reading UI: the inbox, rendered documents, and the
+// small API the pages post back to.
+package web
 
 import (
 	"bytes"
@@ -13,17 +15,18 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
 	chromahtml "github.com/alecthomas/chroma/v2/formatters/html"
-	"github.com/alecthomas/chroma/v2/styles"
 	"github.com/yuin/goldmark"
 	"github.com/yuin/goldmark/extension"
 	"github.com/yuin/goldmark/parser"
 	"github.com/yuin/goldmark/renderer/html"
 	highlighting "github.com/yuin/goldmark-highlighting/v2"
+
+	"github.com/ahaley/markroom/internal/config"
+	"github.com/ahaley/markroom/internal/index"
 )
 
 // Extensions of non-markdown files we are willing to serve from a root,
@@ -53,73 +56,25 @@ var md = goldmark.New(
 
 // Server serves the reading UI over a Store and the current config.
 type Server struct {
-	store *Store
-	cfg   atomic.Pointer[Config]
+	store *index.Store
+	cfg   atomic.Pointer[config.Config]
 
 	// reloadConfig refreshes the whitelist before a rescan; overridable in
 	// tests so handlers never touch the real user config.
-	reloadConfig func() (*Config, error)
+	reloadConfig func() (*config.Config, error)
 }
 
-func NewServer(store *Store, cfg *Config) *Server {
-	s := &Server{store: store, reloadConfig: loadConfig}
+func NewServer(store *index.Store, cfg *config.Config) *Server {
+	s := &Server{store: store, reloadConfig: config.Load}
 	s.cfg.Store(cfg)
 	return s
 }
 
-// Handler builds the route table.
-func (s *Server) Handler() http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /{$}", s.handleInbox)
-	mux.HandleFunc("GET /d/{root}/{path...}", s.handleDoc)
-	mux.HandleFunc("POST /api/unread", s.handleUnread)
-	mux.HandleFunc("POST /api/rescan", s.handleRescan)
-	mux.HandleFunc("GET /app.css", s.handleCSS)
-	return mux
-}
-
-// reloadAndScan picks up config changes and rescans every root.
-func (s *Server) reloadAndScan(ctx context.Context) {
-	if fresh, err := s.reloadConfig(); err == nil {
-		s.cfg.Store(fresh)
-	}
-	s.store.ScanAll(ctx, s.cfg.Load())
-}
-
-func cmdServe(ctx context.Context, args []string) error {
-	addr := "127.0.0.1:8383"
-	var allowHosts []string
-	for i := 0; i < len(args); i++ {
-		switch {
-		case args[i] == "--addr" && i+1 < len(args):
-			addr = args[i+1]
-			i++
-		case args[i] == "--allow-host" && i+1 < len(args):
-			for _, h := range strings.Split(args[i+1], ",") {
-				if h = strings.TrimSpace(h); h != "" {
-					allowHosts = append(allowHosts, h)
-				}
-			}
-			i++
-		default:
-			return fmt.Errorf("unknown flag %q", args[i])
-		}
-	}
-
-	cfg, err := loadConfig()
-	if err != nil {
-		return err
-	}
-	store, err := openDefaultStore()
-	if err != nil {
-		return err
-	}
-	defer store.Close()
-
-	srv := NewServer(store, cfg)
-
+// Run scans, keeps rescanning every 30 seconds, and serves until ctx is
+// canceled, then drains in-flight requests.
+func (s *Server) Run(ctx context.Context, addr string, allowHosts []string) error {
 	fmt.Println("markroom: initial scan…")
-	store.ScanAll(ctx, cfg)
+	s.store.ScanAll(ctx, s.cfg.Load().Roots)
 
 	// Periodic rescan keeps the index tracking whatever agents write.
 	go func() {
@@ -130,14 +85,14 @@ func cmdServe(ctx context.Context, args []string) error {
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				srv.reloadAndScan(ctx)
+				s.reloadAndScan(ctx)
 			}
 		}
 	}()
 
 	httpSrv := &http.Server{
 		Addr:              addr,
-		Handler:           hostGuard(addr, allowHosts, srv.Handler()),
+		Handler:           hostGuard(addr, allowHosts, s.Handler()),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	errCh := make(chan error, 1)
@@ -160,9 +115,28 @@ func cmdServe(ctx context.Context, args []string) error {
 	}
 }
 
+// Handler builds the route table.
+func (s *Server) Handler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /{$}", s.handleInbox)
+	mux.HandleFunc("GET /d/{root}/{path...}", s.handleDoc)
+	mux.HandleFunc("POST /api/unread", s.handleUnread)
+	mux.HandleFunc("POST /api/rescan", s.handleRescan)
+	mux.HandleFunc("GET /app.css", s.handleCSS)
+	return mux
+}
+
+// reloadAndScan picks up config changes and rescans every root.
+func (s *Server) reloadAndScan(ctx context.Context) {
+	if fresh, err := s.reloadConfig(); err == nil {
+		s.cfg.Store(fresh)
+	}
+	s.store.ScanAll(ctx, s.cfg.Load().Roots)
+}
+
 func (s *Server) handleInbox(w http.ResponseWriter, r *http.Request) {
 	q := strings.TrimSpace(r.URL.Query().Get("q"))
-	var docs []Doc
+	var docs []index.Doc
 	var err error
 	if q != "" {
 		docs, err = s.store.Search(r.Context(), q)
@@ -177,7 +151,7 @@ func (s *Server) handleInbox(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDoc(w http.ResponseWriter, r *http.Request) {
-	root := s.cfg.Load().find(r.PathValue("root"))
+	root := s.cfg.Load().Find(r.PathValue("root"))
 	if root == nil {
 		http.NotFound(w, r)
 		return
@@ -190,7 +164,7 @@ func (s *Server) handleDoc(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !isMarkdown(full) {
+	if !index.IsMarkdown(full) {
 		if !assetExts[strings.ToLower(filepath.Ext(full))] {
 			http.NotFound(w, r)
 			return
@@ -216,7 +190,7 @@ func (s *Server) handleDoc(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var buf bytes.Buffer
-	if err := md.Convert([]byte(stripFrontmatter(string(content))), &buf); err != nil {
+	if err := md.Convert([]byte(index.StripFrontmatter(string(content))), &buf); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -303,14 +277,3 @@ func hostGuard(addr string, extra []string, next http.Handler) http.Handler {
 		next.ServeHTTP(w, r)
 	})
 }
-
-// fullCSS lazily renders the chroma stylesheets exactly once; concurrent
-// /app.css requests share the same computation.
-var fullCSS = sync.OnceValue(func() string {
-	f := chromahtml.New(chromahtml.WithClasses(true))
-	var light, dark strings.Builder
-	_ = f.WriteCSS(&light, styles.Get("github"))
-	_ = f.WriteCSS(&dark, styles.Get("github-dark"))
-	return baseCSS + light.String() +
-		"\n@media (prefers-color-scheme: dark){\n" + dark.String() + "\n}\n"
-})

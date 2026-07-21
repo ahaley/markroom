@@ -1,0 +1,34 @@
+{{define "inbox"}}{{template "head" .}}
+<body class="inbox">
+<header class="bar">
+  <a class="brand" href="/">markroom</a>
+  <form class="search" action="/" method="get">
+    <input type="search" name="q" value="{{.Query}}" placeholder="search everything…" autocomplete="off">
+  </form>
+  <form action="/api/rescan" method="post"><button class="ghost" title="rescan roots">↻</button></form>
+</header>
+<main>
+{{if .Query}}<p class="meta">{{len .Docs}} result(s) for “{{.Query}}” — <a href="/">clear</a></p>{{end}}
+{{if not .Docs}}<p class="empty">{{if .Query}}Nothing matched.{{else}}Oh, hi Mark. Nothing indexed yet — register a directory with <code>markroom add &lt;dir&gt;</code>.{{end}}</p>{{end}}
+<ul class="docs">
+{{range .Docs}}
+  <li class="{{.Status}}">
+    <a class="doc" href="/d/{{.Root}}/{{.RelPath}}">
+      <span class="row1">
+        <span class="title">{{.Title}}</span>
+        {{if eq .Status "new"}}<span class="badge new">new</span>{{end}}
+        {{if eq .Status "updated"}}<span class="badge updated">updated</span>{{end}}
+      </span>
+      <span class="row2">
+        <span class="root">{{.Root}}</span>
+        <span class="path">{{.RelPath}}</span>
+        <span class="dot">·</span> {{timeago .MTime}}
+        <span class="dot">·</span> {{readmins .Words}} min
+      </span>
+      {{if .Snippet}}<span class="snippet">{{raw .Snippet}}</span>{{end}}
+    </a>
+  </li>
+{{end}}
+</ul>
+</main>
+</body></html>{{end}}

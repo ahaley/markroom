@@ -1,0 +1,18 @@
+{{define "doc"}}{{template "head" .}}
+<body class="reader">
+<header class="bar">
+  <a class="brand" href="/">← markroom</a>
+  <span class="docmeta">
+    <span class="root">{{.Doc.Root}}</span>
+    <span class="path">{{.Doc.RelPath}}</span>
+    <span class="dot">·</span> {{timeago .Doc.MTime}}
+    <span class="dot">·</span> {{readmins .Doc.Words}} min
+  </span>
+  <form action="/api/unread" method="post">
+    <input type="hidden" name="root" value="{{.Doc.Root}}">
+    <input type="hidden" name="path" value="{{.Doc.RelPath}}">
+    <button class="ghost" title="mark unread">mark unread</button>
+  </form>
+</header>
+<main><article>{{raw .HTML}}</article></main>
+</body></html>{{end}}

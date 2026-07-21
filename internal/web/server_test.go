@@ -1,22 +1,40 @@
-package main
+package web
 
 import (
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/ahaley/markroom/internal/config"
+	"github.com/ahaley/markroom/internal/index"
 )
+
+func writeFile(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func newTestServer(t *testing.T) (*Server, string) {
 	t.Helper()
-	store := testStore(t)
+	store, err := index.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { store.Close() })
 	dir := t.TempDir()
-	cfg := &Config{Roots: []Root{{Name: "docs", Path: dir}}}
+	cfg := &config.Config{Roots: []config.Root{{Name: "docs", Path: dir}}}
 	srv := NewServer(store, cfg)
-	srv.reloadConfig = func() (*Config, error) { return cfg, nil }
+	srv.reloadConfig = func() (*config.Config, error) { return cfg, nil }
 	return srv, dir
 }
 

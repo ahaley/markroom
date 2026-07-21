@@ -1,4 +1,6 @@
-package main
+// Package index maintains the SQLite FTS5 catalog of markdown documents and
+// their per-document read state.
+package index
 
 import (
 	"context"
@@ -14,6 +16,8 @@ import (
 	"time"
 
 	_ "modernc.org/sqlite"
+
+	"github.com/ahaley/markroom/internal/config"
 )
 
 // Directory names never descended into during a scan.
@@ -27,8 +31,8 @@ type Store struct {
 	db *sql.DB
 }
 
-// OpenStore opens (creating if necessary) the index database at path.
-func OpenStore(path string) (*Store, error) {
+// Open opens (creating if necessary) the index database at path.
+func Open(path string) (*Store, error) {
 	dsn := "file:" + filepath.ToSlash(path) +
 		"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)"
 	db, err := sql.Open("sqlite", dsn)
@@ -42,15 +46,6 @@ func OpenStore(path string) (*Store, error) {
 		return nil, err
 	}
 	return &Store{db: db}, nil
-}
-
-// openDefaultStore opens the index in the user's config directory.
-func openDefaultStore() (*Store, error) {
-	dir, err := configDir()
-	if err != nil {
-		return nil, err
-	}
-	return OpenStore(filepath.Join(dir, "index.db"))
 }
 
 func (s *Store) Close() error { return s.db.Close() }
@@ -90,14 +85,15 @@ type Doc struct {
 	Snippet string // populated by search only (trusted HTML from FTS snippet)
 }
 
-func isMarkdown(name string) bool {
+// IsMarkdown reports whether the filename has a markdown extension.
+func IsMarkdown(name string) bool {
 	ext := strings.ToLower(filepath.Ext(name))
 	return ext == ".md" || ext == ".markdown"
 }
 
 // ScanRoot walks one root, upserts changed docs, and removes vanished ones.
 // It returns the number of documents now indexed under the root.
-func (s *Store) ScanRoot(ctx context.Context, root Root) (int, error) {
+func (s *Store) ScanRoot(ctx context.Context, root config.Root) (int, error) {
 	seen := map[string]bool{}
 	err := filepath.WalkDir(root.Path, func(path string, d fs.DirEntry, err error) error {
 		if ctxErr := ctx.Err(); ctxErr != nil {
@@ -113,7 +109,7 @@ func (s *Store) ScanRoot(ctx context.Context, root Root) (int, error) {
 			}
 			return nil
 		}
-		if !isMarkdown(d.Name()) {
+		if !IsMarkdown(d.Name()) {
 			return nil
 		}
 		rel, err := filepath.Rel(root.Path, path)
@@ -172,10 +168,10 @@ func (s *Store) ScanRoot(ctx context.Context, root Root) (int, error) {
 	return count, nil
 }
 
-// ScanAll scans every configured root, logging (not returning) per-root failures
-// so one unreadable root can't stop the others from staying fresh.
-func (s *Store) ScanAll(ctx context.Context, cfg *Config) {
-	for _, r := range cfg.Roots {
+// ScanAll scans every root, logging (not returning) per-root failures so one
+// unreadable root can't stop the others from staying fresh.
+func (s *Store) ScanAll(ctx context.Context, roots []config.Root) {
+	for _, r := range roots {
 		if _, err := s.ScanRoot(ctx, r); err != nil {
 			slog.Warn("scan failed", "root", r.Name, "err", err)
 		}
@@ -185,7 +181,7 @@ func (s *Store) ScanAll(ctx context.Context, cfg *Config) {
 func (s *Store) UpsertDoc(ctx context.Context, rootName, rel string, content []byte, mtime time.Time, size int64) error {
 	sum := sha256.Sum256(content)
 	hash := hex.EncodeToString(sum[:])
-	body := stripFrontmatter(string(content))
+	body := StripFrontmatter(string(content))
 	title := extractTitle(body, rel)
 	words := len(strings.Fields(body))
 
@@ -348,8 +344,8 @@ func (s *Store) MarkUnread(ctx context.Context, docID int64) error {
 	return err
 }
 
-// stripFrontmatter removes a leading YAML frontmatter block if present.
-func stripFrontmatter(s string) string {
+// StripFrontmatter removes a leading YAML frontmatter block if present.
+func StripFrontmatter(s string) string {
 	if !strings.HasPrefix(s, "---") {
 		return s
 	}

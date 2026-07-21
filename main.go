@@ -14,6 +14,10 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+
+	"github.com/ahaley/markroom/internal/config"
+	"github.com/ahaley/markroom/internal/index"
+	"github.com/ahaley/markroom/internal/web"
 )
 
 func main() {
@@ -63,6 +67,15 @@ To read from your phone over Tailscale:
   tailscale serve --bg http://127.0.0.1:8383`)
 }
 
+// openStore opens the index database in the user's config directory.
+func openStore() (*index.Store, error) {
+	dir, err := config.Dir()
+	if err != nil {
+		return nil, err
+	}
+	return index.Open(filepath.Join(dir, "index.db"))
+}
+
 func cmdAdd(ctx context.Context, args []string) error {
 	var dir, name string
 	for i := 0; i < len(args); i++ {
@@ -93,7 +106,7 @@ func cmdAdd(ctx context.Context, args []string) error {
 		name = slugify(filepath.Base(abs))
 	}
 
-	cfg, err := loadConfig()
+	cfg, err := config.Load()
 	if err != nil {
 		return err
 	}
@@ -105,17 +118,17 @@ func cmdAdd(ctx context.Context, args []string) error {
 			return fmt.Errorf("%s is already registered as %q", abs, r.Name)
 		}
 	}
-	cfg.Roots = append(cfg.Roots, Root{Name: name, Path: abs})
-	if err := cfg.save(); err != nil {
+	cfg.Roots = append(cfg.Roots, config.Root{Name: name, Path: abs})
+	if err := cfg.Save(); err != nil {
 		return err
 	}
 
-	store, err := openDefaultStore()
+	store, err := openStore()
 	if err != nil {
 		return err
 	}
 	defer store.Close()
-	n, err := store.ScanRoot(ctx, Root{Name: name, Path: abs})
+	n, err := store.ScanRoot(ctx, config.Root{Name: name, Path: abs})
 	if err != nil {
 		return err
 	}
@@ -128,7 +141,7 @@ func cmdRemove(ctx context.Context, args []string) error {
 		return fmt.Errorf("usage: markroom remove <name>")
 	}
 	name := args[0]
-	cfg, err := loadConfig()
+	cfg, err := config.Load()
 	if err != nil {
 		return err
 	}
@@ -146,10 +159,10 @@ func cmdRemove(ctx context.Context, args []string) error {
 		return fmt.Errorf("no root named %q", name)
 	}
 	cfg.Roots = kept
-	if err := cfg.save(); err != nil {
+	if err := cfg.Save(); err != nil {
 		return err
 	}
-	store, err := openDefaultStore()
+	store, err := openStore()
 	if err != nil {
 		return err
 	}
@@ -162,7 +175,7 @@ func cmdRemove(ctx context.Context, args []string) error {
 }
 
 func cmdList(ctx context.Context) error {
-	cfg, err := loadConfig()
+	cfg, err := config.Load()
 	if err != nil {
 		return err
 	}
@@ -170,7 +183,7 @@ func cmdList(ctx context.Context) error {
 		fmt.Println("no roots registered — use: markroom add <dir>")
 		return nil
 	}
-	store, err := openDefaultStore()
+	store, err := openStore()
 	if err != nil {
 		return err
 	}
@@ -183,6 +196,39 @@ func cmdList(ctx context.Context) error {
 		fmt.Printf("%-20s %s  (%d docs, %d unread)\n", r.Name, r.Path, total, unread)
 	}
 	return nil
+}
+
+func cmdServe(ctx context.Context, args []string) error {
+	addr := "127.0.0.1:8383"
+	var allowHosts []string
+	for i := 0; i < len(args); i++ {
+		switch {
+		case args[i] == "--addr" && i+1 < len(args):
+			addr = args[i+1]
+			i++
+		case args[i] == "--allow-host" && i+1 < len(args):
+			for _, h := range strings.Split(args[i+1], ",") {
+				if h = strings.TrimSpace(h); h != "" {
+					allowHosts = append(allowHosts, h)
+				}
+			}
+			i++
+		default:
+			return fmt.Errorf("unknown flag %q", args[i])
+		}
+	}
+
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	store, err := openStore()
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+
+	return web.NewServer(store, cfg).Run(ctx, addr, allowHosts)
 }
 
 func slugify(s string) string {

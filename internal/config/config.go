@@ -1,4 +1,6 @@
-package main
+// Package config stores the whitelist of markdown roots in the platform's
+// standard user config directory.
+package config
 
 import (
 	"encoding/json"
@@ -17,7 +19,8 @@ type Config struct {
 	Roots []Root `json:"roots"`
 }
 
-func configDir() (string, error) {
+// Dir returns (creating if necessary) the markroom config directory.
+func Dir() (string, error) {
 	base, err := os.UserConfigDir()
 	if err != nil {
 		return "", err
@@ -29,16 +32,16 @@ func configDir() (string, error) {
 	return dir, nil
 }
 
-func configPath() (string, error) {
-	dir, err := configDir()
+func path() (string, error) {
+	dir, err := Dir()
 	if err != nil {
 		return "", err
 	}
 	return filepath.Join(dir, "config.json"), nil
 }
 
-func loadConfig() (*Config, error) {
-	p, err := configPath()
+func Load() (*Config, error) {
+	p, err := path()
 	if err != nil {
 		return nil, err
 	}
@@ -56,8 +59,8 @@ func loadConfig() (*Config, error) {
 	return &cfg, nil
 }
 
-func (c *Config) save() error {
-	p, err := configPath()
+func (c *Config) Save() error {
+	p, err := path()
 	if err != nil {
 		return err
 	}
@@ -68,7 +71,8 @@ func (c *Config) save() error {
 	return os.WriteFile(p, append(data, '\n'), 0o644)
 }
 
-func (c *Config) find(name string) *Root {
+// Find returns the root with the given name, or nil.
+func (c *Config) Find(name string) *Root {
 	for i := range c.Roots {
 		if c.Roots[i].Name == name {
 			return &c.Roots[i]

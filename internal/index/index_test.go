@@ -1,4 +1,4 @@
-package main
+package index
 
 import (
 	"database/sql"
@@ -7,11 +7,13 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/ahaley/markroom/internal/config"
 )
 
 func testStore(t *testing.T) *Store {
 	t.Helper()
-	s, err := OpenStore(filepath.Join(t.TempDir(), "test.db"))
+	s, err := Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -32,7 +34,7 @@ func writeFile(t *testing.T, path, content string) {
 func TestScanRootLifecycle(t *testing.T) {
 	store := testStore(t)
 	dir := t.TempDir()
-	root := Root{Name: "test", Path: dir}
+	root := config.Root{Name: "test", Path: dir}
 
 	writeFile(t, filepath.Join(dir, "a.md"), "# Title A\n\nhello world from doc a")
 	writeFile(t, filepath.Join(dir, "sub", "b.md"), "no heading here")
@@ -184,8 +186,8 @@ func TestStripFrontmatter(t *testing.T) {
 		{"empty", "", ""},
 	}
 	for _, tt := range tests {
-		if got := stripFrontmatter(tt.in); got != tt.want {
-			t.Errorf("%s: stripFrontmatter(%q) = %q, want %q", tt.name, tt.in, got, tt.want)
+		if got := StripFrontmatter(tt.in); got != tt.want {
+			t.Errorf("%s: StripFrontmatter(%q) = %q, want %q", tt.name, tt.in, got, tt.want)
 		}
 	}
 }
@@ -211,8 +213,8 @@ func TestIsMarkdown(t *testing.T) {
 		"a.md": true, "B.MD": true, "c.markdown": true,
 		"d.txt": false, "md": false, "e.md.bak": false,
 	} {
-		if got := isMarkdown(name); got != want {
-			t.Errorf("isMarkdown(%q) = %v, want %v", name, got, want)
+		if got := IsMarkdown(name); got != want {
+			t.Errorf("IsMarkdown(%q) = %v, want %v", name, got, want)
 		}
 	}
 }
