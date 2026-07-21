@@ -21,12 +21,14 @@ var skipDirs = map[string]bool{
 	"dist": true, "build": true, "target": true, "__pycache__": true,
 }
 
-func openDB() (*sql.DB, error) {
-	dir, err := configDir()
-	if err != nil {
-		return nil, err
-	}
-	dsn := "file:" + filepath.ToSlash(filepath.Join(dir, "index.db")) +
+// Store owns the SQLite index of documents and read state.
+type Store struct {
+	db *sql.DB
+}
+
+// OpenStore opens (creating if necessary) the index database at path.
+func OpenStore(path string) (*Store, error) {
+	dsn := "file:" + filepath.ToSlash(path) +
 		"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
@@ -38,8 +40,19 @@ func openDB() (*sql.DB, error) {
 		db.Close()
 		return nil, err
 	}
-	return db, nil
+	return &Store{db: db}, nil
 }
+
+// openDefaultStore opens the index in the user's config directory.
+func openDefaultStore() (*Store, error) {
+	dir, err := configDir()
+	if err != nil {
+		return nil, err
+	}
+	return OpenStore(filepath.Join(dir, "index.db"))
+}
+
+func (s *Store) Close() error { return s.db.Close() }
 
 func migrate(db *sql.DB) error {
 	_, err := db.Exec(`
@@ -81,9 +94,9 @@ func isMarkdown(name string) bool {
 	return ext == ".md" || ext == ".markdown"
 }
 
-// scanRoot walks one root, upserts changed docs, and removes vanished ones.
+// ScanRoot walks one root, upserts changed docs, and removes vanished ones.
 // It returns the number of documents now indexed under the root.
-func scanRoot(db *sql.DB, root Root) (int, error) {
+func (s *Store) ScanRoot(root Root) (int, error) {
 	seen := map[string]bool{}
 	err := filepath.WalkDir(root.Path, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -111,7 +124,7 @@ func scanRoot(db *sql.DB, root Root) (int, error) {
 			return nil
 		}
 		var mtime, size int64
-		row := db.QueryRow(`SELECT mtime, size FROM docs WHERE root=? AND relpath=?`, root.Name, rel)
+		row := s.db.QueryRow(`SELECT mtime, size FROM docs WHERE root=? AND relpath=?`, root.Name, rel)
 		if scanErr := row.Scan(&mtime, &size); scanErr == nil &&
 			mtime == info.ModTime().Unix() && size == info.Size() {
 			return nil // unchanged
@@ -120,14 +133,14 @@ func scanRoot(db *sql.DB, root Root) (int, error) {
 		if err != nil {
 			return nil
 		}
-		return upsertDoc(db, root.Name, rel, content, info.ModTime(), info.Size())
+		return s.UpsertDoc(root.Name, rel, content, info.ModTime(), info.Size())
 	})
 	if err != nil {
 		return 0, err
 	}
 
 	// Purge rows for files that no longer exist.
-	rows, err := db.Query(`SELECT id, relpath FROM docs WHERE root=?`, root.Name)
+	rows, err := s.db.Query(`SELECT id, relpath FROM docs WHERE root=?`, root.Name)
 	if err != nil {
 		return 0, err
 	}
@@ -148,22 +161,24 @@ func scanRoot(db *sql.DB, root Root) (int, error) {
 	}
 	rows.Close()
 	for _, id := range dead {
-		if err := deleteDoc(db, id); err != nil {
+		if err := s.deleteDoc(id); err != nil {
 			return 0, err
 		}
 	}
 	return count, nil
 }
 
-func scanAll(db *sql.DB, cfg *Config) {
+// ScanAll scans every configured root, logging (not returning) per-root failures
+// so one unreadable root can't stop the others from staying fresh.
+func (s *Store) ScanAll(cfg *Config) {
 	for _, r := range cfg.Roots {
-		if _, err := scanRoot(db, r); err != nil {
+		if _, err := s.ScanRoot(r); err != nil {
 			fmt.Fprintf(os.Stderr, "markroom: scan %s: %v\n", r.Name, err)
 		}
 	}
 }
 
-func upsertDoc(db *sql.DB, rootName, rel string, content []byte, mtime time.Time, size int64) error {
+func (s *Store) UpsertDoc(rootName, rel string, content []byte, mtime time.Time, size int64) error {
 	sum := sha256.Sum256(content)
 	hash := hex.EncodeToString(sum[:])
 	body := stripFrontmatter(string(content))
@@ -171,18 +186,18 @@ func upsertDoc(db *sql.DB, rootName, rel string, content []byte, mtime time.Time
 	words := len(strings.Fields(body))
 
 	var id int64
-	err := db.QueryRow(`SELECT id FROM docs WHERE root=? AND relpath=?`, rootName, rel).Scan(&id)
+	err := s.db.QueryRow(`SELECT id FROM docs WHERE root=? AND relpath=?`, rootName, rel).Scan(&id)
 	switch {
 	case err == nil:
-		if _, err := db.Exec(`UPDATE docs SET title=?, hash=?, mtime=?, size=?, words=? WHERE id=?`,
+		if _, err := s.db.Exec(`UPDATE docs SET title=?, hash=?, mtime=?, size=?, words=? WHERE id=?`,
 			title, hash, mtime.Unix(), size, words, id); err != nil {
 			return err
 		}
-		if _, err := db.Exec(`DELETE FROM docs_fts WHERE rowid=?`, id); err != nil {
+		if _, err := s.db.Exec(`DELETE FROM docs_fts WHERE rowid=?`, id); err != nil {
 			return err
 		}
 	case errors.Is(err, sql.ErrNoRows):
-		res, err := db.Exec(`INSERT INTO docs(root, relpath, title, hash, mtime, size, words) VALUES(?,?,?,?,?,?,?)`,
+		res, err := s.db.Exec(`INSERT INTO docs(root, relpath, title, hash, mtime, size, words) VALUES(?,?,?,?,?,?,?)`,
 			rootName, rel, title, hash, mtime.Unix(), size, words)
 		if err != nil {
 			return err
@@ -191,25 +206,26 @@ func upsertDoc(db *sql.DB, rootName, rel string, content []byte, mtime time.Time
 	default:
 		return err
 	}
-	_, err = db.Exec(`INSERT INTO docs_fts(rowid, title, body) VALUES(?,?,?)`, id, title, body)
+	_, err = s.db.Exec(`INSERT INTO docs_fts(rowid, title, body) VALUES(?,?,?)`, id, title, body)
 	return err
 }
 
-func deleteDoc(db *sql.DB, id int64) error {
+func (s *Store) deleteDoc(id int64) error {
 	for _, q := range []string{
 		`DELETE FROM docs_fts WHERE rowid=?`,
 		`DELETE FROM read_state WHERE doc_id=?`,
 		`DELETE FROM docs WHERE id=?`,
 	} {
-		if _, err := db.Exec(q, id); err != nil {
+		if _, err := s.db.Exec(q, id); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func purgeRoot(db *sql.DB, rootName string) error {
-	rows, err := db.Query(`SELECT id FROM docs WHERE root=?`, rootName)
+// PurgeRoot removes every indexed document belonging to a root.
+func (s *Store) PurgeRoot(rootName string) error {
+	rows, err := s.db.Query(`SELECT id FROM docs WHERE root=?`, rootName)
 	if err != nil {
 		return err
 	}
@@ -224,15 +240,15 @@ func purgeRoot(db *sql.DB, rootName string) error {
 	}
 	rows.Close()
 	for _, id := range ids {
-		if err := deleteDoc(db, id); err != nil {
+		if err := s.deleteDoc(id); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func rootStats(db *sql.DB, rootName string) (total, unread int, err error) {
-	err = db.QueryRow(`
+func (s *Store) RootStats(rootName string) (total, unread int, err error) {
+	err = s.db.QueryRow(`
 SELECT COUNT(*),
        COALESCE(SUM(CASE WHEN r.hash_read IS NULL OR r.hash_read <> d.hash THEN 1 ELSE 0 END), 0)
 FROM docs d LEFT JOIN read_state r ON r.doc_id = d.id
@@ -245,9 +261,9 @@ const docStatusExpr = `CASE
   WHEN r.hash_read <> d.hash THEN 'updated'
   ELSE 'read' END`
 
-// listDocs returns every doc, unread first, then most recently modified.
-func listDocs(db *sql.DB) ([]Doc, error) {
-	rows, err := db.Query(`
+// ListDocs returns every doc, unread first, then most recently modified.
+func (s *Store) ListDocs() ([]Doc, error) {
+	rows, err := s.db.Query(`
 SELECT d.id, d.root, d.relpath, d.title, d.hash, d.mtime, d.words, ` + docStatusExpr + `
 FROM docs d LEFT JOIN read_state r ON r.doc_id = d.id
 ORDER BY (r.hash_read IS NULL OR r.hash_read <> d.hash) DESC, d.mtime DESC`)
@@ -258,8 +274,8 @@ ORDER BY (r.hash_read IS NULL OR r.hash_read <> d.hash) DESC, d.mtime DESC`)
 	return collectDocs(rows, false)
 }
 
-// searchDocs runs an FTS5 match built from user input.
-func searchDocs(db *sql.DB, query string) ([]Doc, error) {
+// Search runs an FTS5 match built from user input.
+func (s *Store) Search(query string) ([]Doc, error) {
 	var terms []string
 	for _, t := range strings.Fields(query) {
 		terms = append(terms, `"`+strings.ReplaceAll(t, `"`, `""`)+`"*`)
@@ -267,7 +283,7 @@ func searchDocs(db *sql.DB, query string) ([]Doc, error) {
 	if len(terms) == 0 {
 		return nil, nil
 	}
-	rows, err := db.Query(`
+	rows, err := s.db.Query(`
 SELECT d.id, d.root, d.relpath, d.title, d.hash, d.mtime, d.words, `+docStatusExpr+`,
        snippet(docs_fts, 1, '<mark>', '</mark>', ' … ', 18)
 FROM docs_fts
@@ -300,8 +316,8 @@ func collectDocs(rows *sql.Rows, withSnippet bool) ([]Doc, error) {
 	return docs, rows.Err()
 }
 
-func getDoc(db *sql.DB, rootName, rel string) (*Doc, error) {
-	row := db.QueryRow(`
+func (s *Store) GetDoc(rootName, rel string) (*Doc, error) {
+	row := s.db.QueryRow(`
 SELECT d.id, d.root, d.relpath, d.title, d.hash, d.mtime, d.words, `+docStatusExpr+`
 FROM docs d LEFT JOIN read_state r ON r.doc_id = d.id
 WHERE d.root=? AND d.relpath=?`, rootName, rel)
@@ -315,16 +331,16 @@ WHERE d.root=? AND d.relpath=?`, rootName, rel)
 	return &d, nil
 }
 
-func markRead(db *sql.DB, docID int64, hash string) error {
-	_, err := db.Exec(`
+func (s *Store) MarkRead(docID int64, hash string) error {
+	_, err := s.db.Exec(`
 INSERT INTO read_state(doc_id, read_at, hash_read) VALUES(?,?,?)
 ON CONFLICT(doc_id) DO UPDATE SET read_at=excluded.read_at, hash_read=excluded.hash_read`,
 		docID, time.Now().Unix(), hash)
 	return err
 }
 
-func markUnread(db *sql.DB, docID int64) error {
-	_, err := db.Exec(`DELETE FROM read_state WHERE doc_id=?`, docID)
+func (s *Store) MarkUnread(docID int64) error {
+	_, err := s.db.Exec(`DELETE FROM read_state WHERE doc_id=?`, docID)
 	return err
 }
 

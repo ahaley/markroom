@@ -9,20 +9,14 @@ import (
 	"time"
 )
 
-func testDB(t *testing.T) *sql.DB {
+func testStore(t *testing.T) *Store {
 	t.Helper()
-	dsn := "file:" + filepath.ToSlash(filepath.Join(t.TempDir(), "test.db")) +
-		"?_pragma=busy_timeout(5000)"
-	db, err := sql.Open("sqlite", dsn)
+	s, err := OpenStore(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	db.SetMaxOpenConns(1)
-	if err := migrate(db); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { db.Close() })
-	return db
+	t.Cleanup(func() { s.Close() })
+	return s
 }
 
 func writeFile(t *testing.T, path, content string) {
@@ -36,7 +30,7 @@ func writeFile(t *testing.T, path, content string) {
 }
 
 func TestScanRootLifecycle(t *testing.T) {
-	db := testDB(t)
+	store := testStore(t)
 	dir := t.TempDir()
 	root := Root{Name: "test", Path: dir}
 
@@ -46,7 +40,7 @@ func TestScanRootLifecycle(t *testing.T) {
 	writeFile(t, filepath.Join(dir, ".hidden", "skip.md"), "# Skipped")
 	writeFile(t, filepath.Join(dir, "not-markdown.txt"), "plain text")
 
-	n, err := scanRoot(db, root)
+	n, err := store.ScanRoot(root)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -54,12 +48,12 @@ func TestScanRootLifecycle(t *testing.T) {
 		t.Fatalf("indexed %d docs, want 2", n)
 	}
 
-	docs, err := listDocs(db)
+	docs, err := store.ListDocs()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(docs) != 2 {
-		t.Fatalf("listDocs returned %d, want 2", len(docs))
+		t.Fatalf("ListDocs returned %d, want 2", len(docs))
 	}
 	for _, d := range docs {
 		if d.Status != "new" {
@@ -67,14 +61,14 @@ func TestScanRootLifecycle(t *testing.T) {
 		}
 	}
 
-	a, err := getDoc(db, "test", "a.md")
+	a, err := store.GetDoc("test", "a.md")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if a.Title != "Title A" {
 		t.Errorf("title = %q, want Title A", a.Title)
 	}
-	b, err := getDoc(db, "test", "sub/b.md")
+	b, err := store.GetDoc("test", "sub/b.md")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,12 +77,12 @@ func TestScanRootLifecycle(t *testing.T) {
 	}
 
 	// Reading pins the current hash.
-	if err := markRead(db, a.ID, a.Hash); err != nil {
+	if err := store.MarkRead(a.ID, a.Hash); err != nil {
 		t.Fatal(err)
 	}
-	a, _ = getDoc(db, "test", "a.md")
+	a, _ = store.GetDoc("test", "a.md")
 	if a.Status != "read" {
-		t.Fatalf("after markRead status = %q, want read", a.Status)
+		t.Fatalf("after MarkRead status = %q, want read", a.Status)
 	}
 
 	// Regeneration flips a read doc to "updated".
@@ -97,49 +91,49 @@ func TestScanRootLifecycle(t *testing.T) {
 	if err := os.Chtimes(filepath.Join(dir, "a.md"), future, future); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := scanRoot(db, root); err != nil {
+	if _, err := store.ScanRoot(root); err != nil {
 		t.Fatal(err)
 	}
-	a, _ = getDoc(db, "test", "a.md")
+	a, _ = store.GetDoc("test", "a.md")
 	if a.Status != "updated" {
 		t.Fatalf("after regeneration status = %q, want updated", a.Status)
 	}
 
-	// markUnread clears read state entirely.
-	if err := markUnread(db, a.ID); err != nil {
+	// MarkUnread clears read state entirely.
+	if err := store.MarkUnread(a.ID); err != nil {
 		t.Fatal(err)
 	}
-	a, _ = getDoc(db, "test", "a.md")
+	a, _ = store.GetDoc("test", "a.md")
 	if a.Status != "new" {
-		t.Fatalf("after markUnread status = %q, want new", a.Status)
+		t.Fatalf("after MarkUnread status = %q, want new", a.Status)
 	}
 
 	// Deleted files leave the index.
 	if err := os.Remove(filepath.Join(dir, "sub", "b.md")); err != nil {
 		t.Fatal(err)
 	}
-	n, err = scanRoot(db, root)
+	n, err = store.ScanRoot(root)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if n != 1 {
 		t.Fatalf("after delete indexed %d, want 1", n)
 	}
-	if _, err := getDoc(db, "test", "sub/b.md"); !errors.Is(err, sql.ErrNoRows) {
+	if _, err := store.GetDoc("test", "sub/b.md"); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("deleted doc still present, err = %v", err)
 	}
 
-	total, unread, err := rootStats(db, "test")
+	total, unread, err := store.RootStats("test")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if total != 1 || unread != 1 {
-		t.Fatalf("rootStats = (%d, %d), want (1, 1)", total, unread)
+		t.Fatalf("RootStats = (%d, %d), want (1, 1)", total, unread)
 	}
 }
 
-func TestSearchDocs(t *testing.T) {
-	db := testDB(t)
+func TestSearch(t *testing.T) {
+	store := testStore(t)
 	now := time.Now()
 	must := func(err error) {
 		t.Helper()
@@ -147,10 +141,10 @@ func TestSearchDocs(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	must(upsertDoc(db, "r", "auth.md", []byte("# Auth Audit\n\nthe token refresh races"), now, 10))
-	must(upsertDoc(db, "r", "pay.md", []byte("# Payments\n\nledger reconciliation notes"), now, 10))
+	must(store.UpsertDoc("r", "auth.md", []byte("# Auth Audit\n\nthe token refresh races"), now, 10))
+	must(store.UpsertDoc("r", "pay.md", []byte("# Payments\n\nledger reconciliation notes"), now, 10))
 
-	docs, err := searchDocs(db, "token")
+	docs, err := store.Search("token")
 	must(err)
 	if len(docs) != 1 || docs[0].RelPath != "auth.md" {
 		t.Fatalf("search token = %+v, want auth.md only", docs)
@@ -160,7 +154,7 @@ func TestSearchDocs(t *testing.T) {
 	}
 
 	// Prefix match: partial words hit.
-	docs, err = searchDocs(db, "reconcil")
+	docs, err = store.Search("reconcil")
 	must(err)
 	if len(docs) != 1 || docs[0].RelPath != "pay.md" {
 		t.Fatalf("prefix search = %+v, want pay.md only", docs)
@@ -168,12 +162,12 @@ func TestSearchDocs(t *testing.T) {
 
 	// Hostile input must not break the FTS query.
 	for _, q := range []string{`"unbalanced`, `a" OR "b`, `NEAR( -- )`, `*`} {
-		if _, err := searchDocs(db, q); err != nil {
+		if _, err := store.Search(q); err != nil {
 			t.Errorf("search %q errored: %v", q, err)
 		}
 	}
 
-	docs, err = searchDocs(db, "nomatchword")
+	docs, err = store.Search("nomatchword")
 	must(err)
 	if len(docs) != 0 {
 		t.Fatalf("expected no results, got %d", len(docs))

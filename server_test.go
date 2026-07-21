@@ -1,10 +1,108 @@
 package main
 
 import (
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"path/filepath"
+	"strings"
 	"testing"
 )
+
+func newTestServer(t *testing.T) (*Server, string) {
+	t.Helper()
+	store := testStore(t)
+	dir := t.TempDir()
+	cfg := &Config{Roots: []Root{{Name: "docs", Path: dir}}}
+	srv := NewServer(store, cfg)
+	srv.reloadConfig = func() (*Config, error) { return cfg, nil }
+	return srv, dir
+}
+
+func get(t *testing.T, client *http.Client, url string, wantStatus int, wantContains ...string) string {
+	t.Helper()
+	resp, err := client.Get(url)
+	if err != nil {
+		t.Fatalf("GET %s: %v", url, err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != wantStatus {
+		t.Fatalf("GET %s = %d, want %d", url, resp.StatusCode, wantStatus)
+	}
+	for _, want := range wantContains {
+		if !strings.Contains(string(body), want) {
+			t.Errorf("GET %s: body missing %q", url, want)
+		}
+	}
+	return string(body)
+}
+
+func TestServerEndToEnd(t *testing.T) {
+	srv, dir := newTestServer(t)
+	writeFile(t, filepath.Join(dir, "spec.md"), "# The Spec\n\nhello body text")
+	writeFile(t, filepath.Join(dir, "img.png"), "not-really-a-png")
+	writeFile(t, filepath.Join(dir, "tool.exe"), "MZ")
+	srv.reloadAndScan()
+
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	client := ts.Client()
+
+	// Inbox lists the doc as unread.
+	get(t, client, ts.URL+"/", http.StatusOK, "The Spec", "badge new")
+
+	// Opening the doc renders markdown and marks it read.
+	get(t, client, ts.URL+"/d/docs/spec.md", http.StatusOK, "<h1", "hello body text")
+	doc, err := srv.store.GetDoc("docs", "spec.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if doc.Status != "read" {
+		t.Fatalf("after open, status = %q, want read", doc.Status)
+	}
+
+	// Whitelisted assets are served; other extensions are not.
+	get(t, client, ts.URL+"/d/docs/img.png", http.StatusOK)
+	get(t, client, ts.URL+"/d/docs/tool.exe", http.StatusNotFound)
+
+	// Path traversal is rejected.
+	get(t, client, ts.URL+"/d/docs/..%2F..%2Fsecret.md", http.StatusNotFound)
+
+	// Unknown root is rejected.
+	get(t, client, ts.URL+"/d/nope/spec.md", http.StatusNotFound)
+
+	// Search hits body text.
+	get(t, client, ts.URL+"/?q=hello", http.StatusOK, "result(s)", "The Spec")
+
+	// Mark-unread flips the doc back (client follows the redirect home).
+	resp, err := client.PostForm(ts.URL+"/api/unread",
+		url.Values{"root": {"docs"}, "path": {"spec.md"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("unread POST final status = %d, want 200", resp.StatusCode)
+	}
+	doc, _ = srv.store.GetDoc("docs", "spec.md")
+	if doc.Status != "new" {
+		t.Fatalf("after unread, status = %q, want new", doc.Status)
+	}
+
+	// Rescan endpoint picks up newly written files.
+	writeFile(t, filepath.Join(dir, "fresh.md"), "# Fresh\n\njust arrived")
+	resp, err = client.Post(ts.URL+"/api/rescan", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	get(t, client, ts.URL+"/", http.StatusOK, "Fresh")
+
+	// Stylesheet includes both base and chroma rules.
+	get(t, client, ts.URL+"/app.css", http.StatusOK, ".chroma", "--bg")
+}
 
 func TestHostGuard(t *testing.T) {
 	ok := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -104,12 +104,12 @@ func cmdAdd(args []string) error {
 		return err
 	}
 
-	db, err := openDB()
+	store, err := openDefaultStore()
 	if err != nil {
 		return err
 	}
-	defer db.Close()
-	n, err := scanRoot(db, Root{Name: name, Path: abs})
+	defer store.Close()
+	n, err := store.ScanRoot(Root{Name: name, Path: abs})
 	if err != nil {
 		return err
 	}
@@ -143,12 +143,12 @@ func cmdRemove(args []string) error {
 	if err := cfg.save(); err != nil {
 		return err
 	}
-	db, err := openDB()
+	store, err := openDefaultStore()
 	if err != nil {
 		return err
 	}
-	defer db.Close()
-	if err := purgeRoot(db, name); err != nil {
+	defer store.Close()
+	if err := store.PurgeRoot(name); err != nil {
 		return err
 	}
 	fmt.Printf("removed %q\n", name)
@@ -164,13 +164,13 @@ func cmdList() error {
 		fmt.Println("no roots registered — use: markroom add <dir>")
 		return nil
 	}
-	db, err := openDB()
+	store, err := openDefaultStore()
 	if err != nil {
 		return err
 	}
-	defer db.Close()
+	defer store.Close()
 	for _, r := range cfg.Roots {
-		total, unread, err := rootStats(db, r.Name)
+		total, unread, err := store.RootStats(r.Name)
 		if err != nil {
 			return err
 		}
