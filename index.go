@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -171,8 +172,8 @@ func upsertDoc(db *sql.DB, rootName, rel string, content []byte, mtime time.Time
 
 	var id int64
 	err := db.QueryRow(`SELECT id FROM docs WHERE root=? AND relpath=?`, rootName, rel).Scan(&id)
-	switch err {
-	case nil:
+	switch {
+	case err == nil:
 		if _, err := db.Exec(`UPDATE docs SET title=?, hash=?, mtime=?, size=?, words=? WHERE id=?`,
 			title, hash, mtime.Unix(), size, words, id); err != nil {
 			return err
@@ -180,7 +181,7 @@ func upsertDoc(db *sql.DB, rootName, rel string, content []byte, mtime time.Time
 		if _, err := db.Exec(`DELETE FROM docs_fts WHERE rowid=?`, id); err != nil {
 			return err
 		}
-	case sql.ErrNoRows:
+	case errors.Is(err, sql.ErrNoRows):
 		res, err := db.Exec(`INSERT INTO docs(root, relpath, title, hash, mtime, size, words) VALUES(?,?,?,?,?,?,?)`,
 			rootName, rel, title, hash, mtime.Unix(), size, words)
 		if err != nil {
@@ -233,29 +234,10 @@ func purgeRoot(db *sql.DB, rootName string) error {
 func rootStats(db *sql.DB, rootName string) (total, unread int, err error) {
 	err = db.QueryRow(`
 SELECT COUNT(*),
-       SUM(CASE WHEN r.hash_read IS NULL OR r.hash_read <> d.hash THEN 1 ELSE 0 END)
+       COALESCE(SUM(CASE WHEN r.hash_read IS NULL OR r.hash_read <> d.hash THEN 1 ELSE 0 END), 0)
 FROM docs d LEFT JOIN read_state r ON r.doc_id = d.id
-WHERE d.root=?`, rootName).Scan(&total, &nullableInt{&unread})
+WHERE d.root=?`, rootName).Scan(&total, &unread)
 	return
-}
-
-// nullableInt scans SQL NULL (SUM over zero rows) as 0.
-type nullableInt struct{ p *int }
-
-func (n *nullableInt) Scan(v any) error {
-	if v == nil {
-		*n.p = 0
-		return nil
-	}
-	switch t := v.(type) {
-	case int64:
-		*n.p = int(t)
-	case float64:
-		*n.p = int(t)
-	default:
-		return fmt.Errorf("unexpected type %T", v)
-	}
-	return nil
 }
 
 const docStatusExpr = `CASE

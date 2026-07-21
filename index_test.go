@@ -2,6 +2,7 @@ package main
 
 import (
 	"database/sql"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -124,7 +125,7 @@ func TestScanRootLifecycle(t *testing.T) {
 	if n != 1 {
 		t.Fatalf("after delete indexed %d, want 1", n)
 	}
-	if _, err := getDoc(db, "test", "sub/b.md"); err != sql.ErrNoRows {
+	if _, err := getDoc(db, "test", "sub/b.md"); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("deleted doc still present, err = %v", err)
 	}
 

@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -257,16 +258,13 @@ func cleanSubpath(p string) string {
 	return p
 }
 
-var chromaCSS string
-
-func fullCSS() string {
-	if chromaCSS == "" {
-		f := chromahtml.New(chromahtml.WithClasses(true))
-		var light, dark strings.Builder
-		_ = f.WriteCSS(&light, styles.Get("github"))
-		_ = f.WriteCSS(&dark, styles.Get("github-dark"))
-		chromaCSS = light.String() +
-			"\n@media (prefers-color-scheme: dark){\n" + dark.String() + "\n}\n"
-	}
-	return baseCSS + chromaCSS
-}
+// fullCSS lazily renders the chroma stylesheets exactly once; concurrent
+// /app.css requests share the same computation.
+var fullCSS = sync.OnceValue(func() string {
+	f := chromahtml.New(chromahtml.WithClasses(true))
+	var light, dark strings.Builder
+	_ = f.WriteCSS(&light, styles.Get("github"))
+	_ = f.WriteCSS(&dark, styles.Get("github-dark"))
+	return baseCSS + light.String() +
+		"\n@media (prefers-color-scheme: dark){\n" + dark.String() + "\n}\n"
+})
