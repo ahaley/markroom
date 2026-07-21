@@ -8,6 +8,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"os"
 	"os/signal"
@@ -77,21 +78,20 @@ func openStore() (*index.Store, error) {
 }
 
 func cmdAdd(ctx context.Context, args []string) error {
-	var dir, name string
-	for i := 0; i < len(args); i++ {
-		switch {
-		case args[i] == "--name" && i+1 < len(args):
-			name = args[i+1]
-			i++
-		case strings.HasPrefix(args[i], "-"):
-			return fmt.Errorf("unknown flag %q", args[i])
-		case dir == "":
-			dir = args[i]
-		default:
-			return fmt.Errorf("unexpected argument %q", args[i])
+	fs := flag.NewFlagSet("add", flag.ContinueOnError)
+	name := fs.String("name", "", "name for the root (default: directory name)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	var dir string
+	if fs.NArg() > 0 {
+		dir = fs.Arg(0)
+		// Re-parse the remainder so `markroom add <dir> --name x` works too.
+		if err := fs.Parse(fs.Args()[1:]); err != nil {
+			return err
 		}
 	}
-	if dir == "" {
+	if dir == "" || fs.NArg() > 0 {
 		return fmt.Errorf("usage: markroom add <dir> [--name <name>]")
 	}
 	abs, err := filepath.Abs(dir)
@@ -102,8 +102,9 @@ func cmdAdd(ctx context.Context, args []string) error {
 	if err != nil || !info.IsDir() {
 		return fmt.Errorf("%s is not a directory", abs)
 	}
-	if name == "" {
-		name = slugify(filepath.Base(abs))
+	rootName := *name
+	if rootName == "" {
+		rootName = slugify(filepath.Base(abs))
 	}
 
 	cfg, err := config.Load()
@@ -111,14 +112,14 @@ func cmdAdd(ctx context.Context, args []string) error {
 		return err
 	}
 	for _, r := range cfg.Roots {
-		if strings.EqualFold(r.Name, name) {
+		if strings.EqualFold(r.Name, rootName) {
 			return fmt.Errorf("a root named %q already exists (%s)", r.Name, r.Path)
 		}
 		if strings.EqualFold(filepath.Clean(r.Path), filepath.Clean(abs)) {
 			return fmt.Errorf("%s is already registered as %q", abs, r.Name)
 		}
 	}
-	cfg.Roots = append(cfg.Roots, config.Root{Name: name, Path: abs})
+	cfg.Roots = append(cfg.Roots, config.Root{Name: rootName, Path: abs})
 	if err := cfg.Save(); err != nil {
 		return err
 	}
@@ -128,11 +129,11 @@ func cmdAdd(ctx context.Context, args []string) error {
 		return err
 	}
 	defer store.Close()
-	n, err := store.ScanRoot(ctx, config.Root{Name: name, Path: abs})
+	n, err := store.ScanRoot(ctx, config.Root{Name: rootName, Path: abs})
 	if err != nil {
 		return err
 	}
-	fmt.Printf("added %q (%s) — indexed %d document(s)\n", name, abs, n)
+	fmt.Printf("added %q (%s) — indexed %d document(s)\n", rootName, abs, n)
 	return nil
 }
 
@@ -199,22 +200,19 @@ func cmdList(ctx context.Context) error {
 }
 
 func cmdServe(ctx context.Context, args []string) error {
-	addr := "127.0.0.1:8383"
+	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
+	addr := fs.String("addr", "127.0.0.1:8383", "listen address")
+	allow := fs.String("allow-host", "", "comma-separated extra hostnames to accept")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("unexpected argument %q", fs.Arg(0))
+	}
 	var allowHosts []string
-	for i := 0; i < len(args); i++ {
-		switch {
-		case args[i] == "--addr" && i+1 < len(args):
-			addr = args[i+1]
-			i++
-		case args[i] == "--allow-host" && i+1 < len(args):
-			for _, h := range strings.Split(args[i+1], ",") {
-				if h = strings.TrimSpace(h); h != "" {
-					allowHosts = append(allowHosts, h)
-				}
-			}
-			i++
-		default:
-			return fmt.Errorf("unknown flag %q", args[i])
+	for _, h := range strings.Split(*allow, ",") {
+		if h = strings.TrimSpace(h); h != "" {
+			allowHosts = append(allowHosts, h)
 		}
 	}
 
@@ -228,7 +226,7 @@ func cmdServe(ctx context.Context, args []string) error {
 	}
 	defer store.Close()
 
-	return web.NewServer(store, cfg).Run(ctx, addr, allowHosts)
+	return web.NewServer(store, cfg).Run(ctx, *addr, allowHosts)
 }
 
 func slugify(s string) string {

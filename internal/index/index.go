@@ -91,9 +91,34 @@ func IsMarkdown(name string) bool {
 	return ext == ".md" || ext == ".markdown"
 }
 
-// ScanRoot walks one root, upserts changed docs, and removes vanished ones.
-// It returns the number of documents now indexed under the root.
+// dbtx is the intersection of *sql.DB and *sql.Tx the write paths need, so
+// the same statements run standalone or inside a scan transaction.
+type dbtx interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+// ScanRoot walks one root, upserts changed docs, and removes vanished ones,
+// all in one transaction so a mid-scan crash can't leave docs and docs_fts
+// disagreeing. It returns the number of documents now indexed under the root.
 func (s *Store) ScanRoot(ctx context.Context, root config.Root) (int, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	count, err := scanRoot(ctx, tx, root)
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+func scanRoot(ctx context.Context, q dbtx, root config.Root) (int, error) {
 	seen := map[string]bool{}
 	err := filepath.WalkDir(root.Path, func(path string, d fs.DirEntry, err error) error {
 		if ctxErr := ctx.Err(); ctxErr != nil {
@@ -124,7 +149,7 @@ func (s *Store) ScanRoot(ctx context.Context, root config.Root) (int, error) {
 			return nil
 		}
 		var mtime, size int64
-		row := s.db.QueryRowContext(ctx, `SELECT mtime, size FROM docs WHERE root=? AND relpath=?`, root.Name, rel)
+		row := q.QueryRowContext(ctx, `SELECT mtime, size FROM docs WHERE root=? AND relpath=?`, root.Name, rel)
 		if scanErr := row.Scan(&mtime, &size); scanErr == nil &&
 			mtime == info.ModTime().Unix() && size == info.Size() {
 			return nil // unchanged
@@ -133,14 +158,14 @@ func (s *Store) ScanRoot(ctx context.Context, root config.Root) (int, error) {
 		if err != nil {
 			return nil
 		}
-		return s.UpsertDoc(ctx, root.Name, rel, content, info.ModTime(), info.Size())
+		return upsertDoc(ctx, q, root.Name, rel, content, info.ModTime(), info.Size())
 	})
 	if err != nil {
 		return 0, err
 	}
 
 	// Purge rows for files that no longer exist.
-	rows, err := s.db.QueryContext(ctx, `SELECT id, relpath FROM docs WHERE root=?`, root.Name)
+	rows, err := q.QueryContext(ctx, `SELECT id, relpath FROM docs WHERE root=?`, root.Name)
 	if err != nil {
 		return 0, err
 	}
@@ -161,7 +186,7 @@ func (s *Store) ScanRoot(ctx context.Context, root config.Root) (int, error) {
 	}
 	rows.Close()
 	for _, id := range dead {
-		if err := s.deleteDoc(ctx, id); err != nil {
+		if err := deleteDoc(ctx, q, id); err != nil {
 			return 0, err
 		}
 	}
@@ -179,6 +204,10 @@ func (s *Store) ScanAll(ctx context.Context, roots []config.Root) {
 }
 
 func (s *Store) UpsertDoc(ctx context.Context, rootName, rel string, content []byte, mtime time.Time, size int64) error {
+	return upsertDoc(ctx, s.db, rootName, rel, content, mtime, size)
+}
+
+func upsertDoc(ctx context.Context, q dbtx, rootName, rel string, content []byte, mtime time.Time, size int64) error {
 	sum := sha256.Sum256(content)
 	hash := hex.EncodeToString(sum[:])
 	body := StripFrontmatter(string(content))
@@ -186,18 +215,18 @@ func (s *Store) UpsertDoc(ctx context.Context, rootName, rel string, content []b
 	words := len(strings.Fields(body))
 
 	var id int64
-	err := s.db.QueryRowContext(ctx, `SELECT id FROM docs WHERE root=? AND relpath=?`, rootName, rel).Scan(&id)
+	err := q.QueryRowContext(ctx, `SELECT id FROM docs WHERE root=? AND relpath=?`, rootName, rel).Scan(&id)
 	switch {
 	case err == nil:
-		if _, err := s.db.ExecContext(ctx, `UPDATE docs SET title=?, hash=?, mtime=?, size=?, words=? WHERE id=?`,
+		if _, err := q.ExecContext(ctx, `UPDATE docs SET title=?, hash=?, mtime=?, size=?, words=? WHERE id=?`,
 			title, hash, mtime.Unix(), size, words, id); err != nil {
 			return err
 		}
-		if _, err := s.db.ExecContext(ctx, `DELETE FROM docs_fts WHERE rowid=?`, id); err != nil {
+		if _, err := q.ExecContext(ctx, `DELETE FROM docs_fts WHERE rowid=?`, id); err != nil {
 			return err
 		}
 	case errors.Is(err, sql.ErrNoRows):
-		res, err := s.db.ExecContext(ctx, `INSERT INTO docs(root, relpath, title, hash, mtime, size, words) VALUES(?,?,?,?,?,?,?)`,
+		res, err := q.ExecContext(ctx, `INSERT INTO docs(root, relpath, title, hash, mtime, size, words) VALUES(?,?,?,?,?,?,?)`,
 			rootName, rel, title, hash, mtime.Unix(), size, words)
 		if err != nil {
 			return err
@@ -206,26 +235,31 @@ func (s *Store) UpsertDoc(ctx context.Context, rootName, rel string, content []b
 	default:
 		return err
 	}
-	_, err = s.db.ExecContext(ctx, `INSERT INTO docs_fts(rowid, title, body) VALUES(?,?,?)`, id, title, body)
+	_, err = q.ExecContext(ctx, `INSERT INTO docs_fts(rowid, title, body) VALUES(?,?,?)`, id, title, body)
 	return err
 }
 
-func (s *Store) deleteDoc(ctx context.Context, id int64) error {
-	for _, q := range []string{
+func deleteDoc(ctx context.Context, q dbtx, id int64) error {
+	for _, stmt := range []string{
 		`DELETE FROM docs_fts WHERE rowid=?`,
 		`DELETE FROM read_state WHERE doc_id=?`,
 		`DELETE FROM docs WHERE id=?`,
 	} {
-		if _, err := s.db.ExecContext(ctx, q, id); err != nil {
+		if _, err := q.ExecContext(ctx, stmt, id); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// PurgeRoot removes every indexed document belonging to a root.
+// PurgeRoot removes every indexed document belonging to a root, atomically.
 func (s *Store) PurgeRoot(ctx context.Context, rootName string) error {
-	rows, err := s.db.QueryContext(ctx, `SELECT id FROM docs WHERE root=?`, rootName)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	rows, err := tx.QueryContext(ctx, `SELECT id FROM docs WHERE root=?`, rootName)
 	if err != nil {
 		return err
 	}
@@ -240,11 +274,11 @@ func (s *Store) PurgeRoot(ctx context.Context, rootName string) error {
 	}
 	rows.Close()
 	for _, id := range ids {
-		if err := s.deleteDoc(ctx, id); err != nil {
+		if err := deleteDoc(ctx, tx, id); err != nil {
 			return err
 		}
 	}
-	return nil
+	return tx.Commit()
 }
 
 func (s *Store) RootStats(ctx context.Context, rootName string) (total, unread int, err error) {
