@@ -15,6 +15,7 @@ body{margin:0;background:var(--bg);color:var(--fg);
   font:16px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
 a{color:var(--accent);text-decoration:none}
 main{max-width:72ch;margin:0 auto;padding:1rem 1.25rem 4rem}
+.reader main{max-width:44rem}
 
 .bar{position:sticky;top:0;display:flex;align-items:center;gap:.75rem;
   padding:.6rem 1rem;background:var(--bg);border-bottom:1px solid var(--line);z-index:10}
@@ -73,6 +74,14 @@ article th,article td{border:1px solid var(--line);padding:.35rem .7rem;text-ali
 article th{background:var(--code-bg)}
 article hr{border:none;border-top:1px solid var(--line);margin:2rem 0}
 article input[type=checkbox]{margin-right:.4rem}
+
+/* wide code blocks and tables may break out of the prose column on desktop */
+@media (min-width:700px){
+  .reader article>pre,.reader article>table{
+    width:fit-content;min-width:100%;
+    max-width:min(60rem,calc(100vw - 2.5rem));
+    margin-left:50%;transform:translateX(-50%)}
+}
 
 @media (max-width:600px){
   main{padding:.75rem .9rem 3rem}
