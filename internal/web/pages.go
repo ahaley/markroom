@@ -28,9 +28,18 @@ var tpl = template.Must(template.New("").Funcs(template.FuncMap{
 	"raw":      func(s string) template.HTML { return template.HTML(s) },
 }).ParseFS(templateFS, "templates/*.tmpl"))
 
+// rootPill is one entry in the inbox root filter bar.
+type rootPill struct {
+	Name   string
+	Unread int
+	Total  int
+}
+
 type inboxData struct {
 	Title string
 	Query string
+	Root  string     // active root filter, "" = none
+	Roots []rootPill // all registered roots, config order
 	Docs  []index.Doc
 }
 
@@ -40,10 +49,9 @@ type docData struct {
 	HTML  string
 }
 
-func renderInbox(w http.ResponseWriter, query string, docs []index.Doc) {
+func renderInbox(w http.ResponseWriter, d inboxData) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	err := tpl.ExecuteTemplate(w, "inbox", inboxData{Title: "markroom", Query: query, Docs: docs})
-	if err != nil {
+	if err := tpl.ExecuteTemplate(w, "inbox", d); err != nil {
 		slog.Error("render inbox", "err", err)
 	}
 }

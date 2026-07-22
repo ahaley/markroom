@@ -136,18 +136,39 @@ func (s *Server) reloadAndScan(ctx context.Context) {
 
 func (s *Server) handleInbox(w http.ResponseWriter, r *http.Request) {
 	q := strings.TrimSpace(r.URL.Query().Get("q"))
+	cfg := s.cfg.Load()
+
+	// An unknown root is almost always a stale bookmark for a removed root;
+	// degrade to the full inbox rather than 404 on a query param.
+	root := r.URL.Query().Get("root")
+	if root != "" && cfg.Find(root) == nil {
+		root = ""
+	}
+
 	var docs []index.Doc
 	var err error
 	if q != "" {
-		docs, err = s.store.Search(r.Context(), q)
+		docs, err = s.store.Search(r.Context(), q, root)
 	} else {
-		docs, err = s.store.ListDocs(r.Context())
+		docs, err = s.store.ListDocs(r.Context(), root)
 	}
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	renderInbox(w, q, docs)
+
+	counts, err := s.store.AllRootStats(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	pills := make([]rootPill, 0, len(cfg.Roots))
+	for _, rt := range cfg.Roots {
+		c := counts[rt.Name] // zero value keeps a pill for still-empty roots
+		pills = append(pills, rootPill{Name: rt.Name, Unread: c.Unread, Total: c.Total})
+	}
+
+	renderInbox(w, inboxData{Title: "markroom", Query: q, Root: root, Roots: pills, Docs: docs})
 }
 
 func (s *Server) handleDoc(w http.ResponseWriter, r *http.Request) {

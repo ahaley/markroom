@@ -3,7 +3,7 @@
 <header class="bar">
   <a class="brand" href="/">← markroom</a>
   <span class="docmeta">
-    <span class="root">{{.Doc.Root}}</span>
+    <a class="root" href="/?root={{.Doc.Root}}">{{.Doc.Root}}</a>
     <span class="path">{{.Doc.RelPath}}</span>
     <span class="dot">·</span> {{timeago .Doc.MTime}}
     <span class="dot">·</span> {{readmins .Doc.Words}} min

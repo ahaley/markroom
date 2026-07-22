@@ -122,6 +122,70 @@ func TestServerEndToEnd(t *testing.T) {
 	get(t, client, ts.URL+"/app.css", http.StatusOK, ".chroma", "--bg")
 }
 
+func TestRootFilter(t *testing.T) {
+	store, err := index.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { store.Close() })
+	dir1, dir2, dir3 := t.TempDir(), t.TempDir(), t.TempDir()
+	cfg := &config.Config{Roots: []config.Root{
+		{Name: "docs", Path: dir1},
+		{Name: "api docs", Path: dir2}, // space exercises URL encoding end-to-end
+		{Name: "empty", Path: dir3},
+	}}
+	srv := NewServer(store, cfg)
+	srv.reloadConfig = func() (*config.Config, error) { return cfg, nil }
+
+	writeFile(t, filepath.Join(dir1, "spec.md"), "# The Spec\n\nshared word alpha")
+	writeFile(t, filepath.Join(dir2, "guide.md"), "# The Guide\n\nshared word beta")
+	srv.reloadAndScan(t.Context())
+
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	client := ts.Client()
+
+	// Unfiltered inbox: both docs, pill bar with all roots and encoded hrefs.
+	get(t, client, ts.URL+"/", http.StatusOK,
+		"The Spec", "The Guide", `class="roots"`,
+		`href="/?root=docs"`, `href="/?root=api%20docs"`, `href="/?root=empty"`)
+
+	// Filtered: only that root's docs, active pill, meta line, no row badges,
+	// scoped search placeholder, hidden root input.
+	body := get(t, client, ts.URL+"/?root=docs", http.StatusOK,
+		"The Spec", "pill active", "×", "doc(s) in docs",
+		"search in docs…", `name="root" value="docs"`)
+	if strings.Contains(body, "The Guide") {
+		t.Error("filtered inbox leaked a doc from another root")
+	}
+	if strings.Contains(body, `<span class="root">`) {
+		t.Error("filtered inbox still shows per-row root badges")
+	}
+
+	// A root name with a space round-trips.
+	get(t, client, ts.URL+"/?root=api%20docs", http.StatusOK, "The Guide", "pill active")
+
+	// Search composes with the filter; clear link keeps the root.
+	body = get(t, client, ts.URL+"/?q=shared&root=docs", http.StatusOK,
+		"The Spec", "in docs", `href="/?root=docs">clear</a>`)
+	if strings.Contains(body, "The Guide") {
+		t.Error("scoped search leaked a doc from another root")
+	}
+
+	// Unknown root degrades to the full inbox.
+	body = get(t, client, ts.URL+"/?root=nope", http.StatusOK, "The Spec", "The Guide")
+	if strings.Contains(body, "pill active") {
+		t.Error("unknown root produced an active pill")
+	}
+
+	// Empty states.
+	get(t, client, ts.URL+"/?root=empty", http.StatusOK, "Nothing in empty yet.")
+	get(t, client, ts.URL+"/?q=zzzunfindable&root=docs", http.StatusOK, "Nothing matched.")
+
+	// Doc view root badge links back to the filtered inbox.
+	get(t, client, ts.URL+"/d/docs/spec.md", http.StatusOK, `<a class="root" href="/?root=docs">docs</a>`)
+}
+
 func TestHostGuard(t *testing.T) {
 	ok := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)

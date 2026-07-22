@@ -50,7 +50,7 @@ func TestScanRootLifecycle(t *testing.T) {
 		t.Fatalf("indexed %d docs, want 2", n)
 	}
 
-	docs, err := store.ListDocs(t.Context())
+	docs, err := store.ListDocs(t.Context(), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -146,7 +146,7 @@ func TestSearch(t *testing.T) {
 	must(store.UpsertDoc(t.Context(), "r", "auth.md", []byte("# Auth Audit\n\nthe token refresh races"), now, 10))
 	must(store.UpsertDoc(t.Context(), "r", "pay.md", []byte("# Payments\n\nledger reconciliation notes"), now, 10))
 
-	docs, err := store.Search(t.Context(), "token")
+	docs, err := store.Search(t.Context(), "token", "")
 	must(err)
 	if len(docs) != 1 || docs[0].RelPath != "auth.md" {
 		t.Fatalf("search token = %+v, want auth.md only", docs)
@@ -156,7 +156,7 @@ func TestSearch(t *testing.T) {
 	}
 
 	// Prefix match: partial words hit.
-	docs, err = store.Search(t.Context(), "reconcil")
+	docs, err = store.Search(t.Context(), "reconcil", "")
 	must(err)
 	if len(docs) != 1 || docs[0].RelPath != "pay.md" {
 		t.Fatalf("prefix search = %+v, want pay.md only", docs)
@@ -164,15 +164,82 @@ func TestSearch(t *testing.T) {
 
 	// Hostile input must not break the FTS query.
 	for _, q := range []string{`"unbalanced`, `a" OR "b`, `NEAR( -- )`, `*`} {
-		if _, err := store.Search(t.Context(), q); err != nil {
+		if _, err := store.Search(t.Context(), q, ""); err != nil {
 			t.Errorf("search %q errored: %v", q, err)
 		}
 	}
 
-	docs, err = store.Search(t.Context(), "nomatchword")
+	docs, err = store.Search(t.Context(), "nomatchword", "")
 	must(err)
 	if len(docs) != 0 {
 		t.Fatalf("expected no results, got %d", len(docs))
+	}
+}
+
+func TestRootFiltering(t *testing.T) {
+	store := testStore(t)
+	now := time.Now()
+	must := func(err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	must(store.UpsertDoc(t.Context(), "r1", "a.md", []byte("# A\n\nshared alpha"), now, 10))
+	must(store.UpsertDoc(t.Context(), "r1", "b.md", []byte("# B\n\nshared beta"), now, 10))
+	must(store.UpsertDoc(t.Context(), "r2", "c.md", []byte("# C\n\nshared gamma"), now, 10))
+
+	docs, err := store.ListDocs(t.Context(), "")
+	must(err)
+	if len(docs) != 3 {
+		t.Fatalf("unfiltered ListDocs = %d docs, want 3", len(docs))
+	}
+	docs, err = store.ListDocs(t.Context(), "r1")
+	must(err)
+	if len(docs) != 2 {
+		t.Fatalf("ListDocs r1 = %d docs, want 2", len(docs))
+	}
+	for _, d := range docs {
+		if d.Root != "r1" {
+			t.Errorf("ListDocs r1 returned doc from %q", d.Root)
+		}
+	}
+	docs, err = store.ListDocs(t.Context(), "nope")
+	must(err)
+	if len(docs) != 0 {
+		t.Fatalf("ListDocs nope = %d docs, want 0", len(docs))
+	}
+
+	docs, err = store.Search(t.Context(), "shared", "")
+	must(err)
+	if len(docs) != 3 {
+		t.Fatalf("unscoped search = %d docs, want 3", len(docs))
+	}
+	docs, err = store.Search(t.Context(), "shared", "r2")
+	must(err)
+	if len(docs) != 1 || docs[0].RelPath != "c.md" {
+		t.Fatalf("scoped search = %+v, want c.md only", docs)
+	}
+	if docs[0].Snippet == "" {
+		t.Error("expected a non-empty snippet in scoped search")
+	}
+
+	counts, err := store.AllRootStats(t.Context())
+	must(err)
+	if c := counts["r1"]; c.Total != 2 || c.Unread != 2 {
+		t.Fatalf("r1 stats = %+v, want {2 2}", c)
+	}
+	if c := counts["r2"]; c.Total != 1 || c.Unread != 1 {
+		t.Fatalf("r2 stats = %+v, want {1 1}", c)
+	}
+
+	doc, err := store.GetDoc(t.Context(), "r1", "a.md")
+	must(err)
+	must(store.MarkRead(t.Context(), doc.ID, doc.Hash))
+	counts, err = store.AllRootStats(t.Context())
+	must(err)
+	if c := counts["r1"]; c.Total != 2 || c.Unread != 1 {
+		t.Fatalf("r1 stats after read = %+v, want {2 1}", c)
 	}
 }
 

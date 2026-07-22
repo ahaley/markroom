@@ -290,17 +290,52 @@ WHERE d.root=?`, rootName).Scan(&total, &unread)
 	return
 }
 
+// RootCount holds per-root document totals.
+type RootCount struct {
+	Total  int
+	Unread int
+}
+
+// AllRootStats returns counts for every root that has indexed docs.
+func (s *Store) AllRootStats(ctx context.Context) (map[string]RootCount, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT d.root, COUNT(*),
+       COALESCE(SUM(CASE WHEN r.hash_read IS NULL OR r.hash_read <> d.hash THEN 1 ELSE 0 END), 0)
+FROM docs d LEFT JOIN read_state r ON r.doc_id = d.id
+GROUP BY d.root`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	counts := map[string]RootCount{}
+	for rows.Next() {
+		var name string
+		var c RootCount
+		if err := rows.Scan(&name, &c.Total, &c.Unread); err != nil {
+			return nil, err
+		}
+		counts[name] = c
+	}
+	return counts, rows.Err()
+}
+
 const docStatusExpr = `CASE
   WHEN r.hash_read IS NULL THEN 'new'
   WHEN r.hash_read <> d.hash THEN 'updated'
   ELSE 'read' END`
 
-// ListDocs returns every doc, unread first, then most recently modified.
-func (s *Store) ListDocs(ctx context.Context) ([]Doc, error) {
+// ListDocs returns docs (every root when rootName is empty), unread first,
+// then most recently modified.
+func (s *Store) ListDocs(ctx context.Context, rootName string) ([]Doc, error) {
+	where, args := "", []any(nil)
+	if rootName != "" {
+		where, args = "WHERE d.root = ?", []any{rootName}
+	}
 	rows, err := s.db.QueryContext(ctx, `
 SELECT d.id, d.root, d.relpath, d.title, d.hash, d.mtime, d.words, `+docStatusExpr+`
 FROM docs d LEFT JOIN read_state r ON r.doc_id = d.id
-ORDER BY (r.hash_read IS NULL OR r.hash_read <> d.hash) DESC, d.mtime DESC`)
+`+where+`
+ORDER BY (r.hash_read IS NULL OR r.hash_read <> d.hash) DESC, d.mtime DESC`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -308,8 +343,8 @@ ORDER BY (r.hash_read IS NULL OR r.hash_read <> d.hash) DESC, d.mtime DESC`)
 	return collectDocs(rows, false)
 }
 
-// Search runs an FTS5 match built from user input.
-func (s *Store) Search(ctx context.Context, query string) ([]Doc, error) {
+// Search runs an FTS5 match built from user input, optionally scoped to one root.
+func (s *Store) Search(ctx context.Context, query, rootName string) ([]Doc, error) {
 	var terms []string
 	for _, t := range strings.Fields(query) {
 		terms = append(terms, `"`+strings.ReplaceAll(t, `"`, `""`)+`"*`)
@@ -317,14 +352,19 @@ func (s *Store) Search(ctx context.Context, query string) ([]Doc, error) {
 	if len(terms) == 0 {
 		return nil, nil
 	}
+	where, args := "WHERE docs_fts MATCH ?", []any{strings.Join(terms, " ")}
+	if rootName != "" {
+		where += " AND d.root = ?"
+		args = append(args, rootName)
+	}
 	rows, err := s.db.QueryContext(ctx, `
 SELECT d.id, d.root, d.relpath, d.title, d.hash, d.mtime, d.words, `+docStatusExpr+`,
        snippet(docs_fts, 1, '<mark>', '</mark>', ' … ', 18)
 FROM docs_fts
 JOIN docs d ON d.id = docs_fts.rowid
 LEFT JOIN read_state r ON r.doc_id = d.id
-WHERE docs_fts MATCH ?
-ORDER BY rank`, strings.Join(terms, " "))
+`+where+`
+ORDER BY rank`, args...)
 	if err != nil {
 		return nil, err
 	}
