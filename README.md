@@ -32,6 +32,7 @@ markroom remove <name>               unregister a directory (purges its index)
 markroom list                        show registered directories with unread counts
 markroom serve [--addr host:port]    run the reading server (default 127.0.0.1:8383)
                [--allow-host h1,h2]  extra hostnames accepted by the server
+markroom tui [--root <name>]         read in the terminal
 ```
 
 Register the places your agents write to, then leave the server running:
@@ -49,6 +50,23 @@ markroom serve
 Open http://127.0.0.1:8383 — the inbox lists every document, unread first.
 Opening a document marks it read; when an agent regenerates a file you've
 already read, it comes back flagged **updated**.
+
+## Reading in the terminal
+
+`markroom tui` opens the same inbox → document flow in your terminal — no
+server needed (though it happily runs alongside one). Documents render with
+styled headings, tables, and highlighted code.
+
+| Key | Action |
+|-----|--------|
+| `enter` | open the selected document (marks it read) |
+| `/` | search titles and bodies (`esc` clears) |
+| `tab` / `shift+tab` | cycle the root filter |
+| `r` | rescan all roots now |
+| `u` | (in a document) mark unread |
+| `esc` / `q` | back / quit |
+
+Start filtered to one root with `markroom tui --root myapp`.
 
 ## Reading from your phone
 

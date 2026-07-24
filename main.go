@@ -4,6 +4,7 @@
 //	markroom remove <name>               unregister a directory (and purge its index)
 //	markroom list                        show registered directories
 //	markroom serve [--addr host:port]    run the reading server
+//	markroom tui [--root <name>]         read in the terminal
 package main
 
 import (
@@ -18,6 +19,7 @@ import (
 
 	"github.com/ahaley/markroom/internal/config"
 	"github.com/ahaley/markroom/internal/index"
+	"github.com/ahaley/markroom/internal/tui"
 	"github.com/ahaley/markroom/internal/web"
 )
 
@@ -39,6 +41,8 @@ func main() {
 		err = cmdList(ctx)
 	case "serve":
 		err = cmdServe(ctx, os.Args[2:])
+	case "tui":
+		err = cmdTUI(ctx, os.Args[2:])
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -63,6 +67,8 @@ usage:
                  [--allow-host h1,h2]  extra hostnames accepted by the server
                                        (localhost, the bound host, loopback IPs,
                                        and *.ts.net are always accepted)
+  markroom tui [--root <name>]         read in the terminal (optionally filtered
+                                       to one root)
 
 To read from your phone over Tailscale:
   tailscale serve --bg http://127.0.0.1:8383`)
@@ -227,6 +233,41 @@ func cmdServe(ctx context.Context, args []string) error {
 	defer store.Close()
 
 	return web.NewServer(store, cfg).Run(ctx, *addr, allowHosts)
+}
+
+func cmdTUI(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("tui", flag.ContinueOnError)
+	root := fs.String("root", "", "start filtered to this root")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("unexpected argument %q", fs.Arg(0))
+	}
+
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	if *root != "" {
+		found := false
+		for _, r := range cfg.Roots {
+			if strings.EqualFold(r.Name, *root) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("no root named %q", *root)
+		}
+	}
+	store, err := openStore()
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+
+	return tui.Run(ctx, store, cfg, *root)
 }
 
 func slugify(s string) string {
