@@ -21,6 +21,7 @@ import (
 
 	"github.com/ahaley/markroom/internal/config"
 	"github.com/ahaley/markroom/internal/index"
+	"github.com/ahaley/markroom/internal/peer"
 )
 
 // Run starts the TUI and blocks until the user quits or ctx is canceled.
@@ -119,6 +120,15 @@ func newModel(ctx context.Context, store *index.Store, cfg *config.Config, initi
 	}
 }
 
+// originOf names the machine a root's documents were written on, or "" when
+// the root is this machine's own. Origin lives in the config, not the index.
+func (m model) originOf(rootName string) string {
+	if r := m.cfg.Find(rootName); r != nil && r.IsMirror() {
+		return r.OriginName
+	}
+	return ""
+}
+
 // activeRoot returns the name of the root filter, or "" for all roots.
 func (m model) activeRoot() string {
 	if m.rootIdx == 0 || m.rootIdx > len(m.cfg.Roots) {
@@ -146,8 +156,9 @@ type docsMsg struct {
 }
 
 type scanDoneMsg struct {
-	cfg *config.Config
-	err error
+	cfg  *config.Config
+	note string // non-fatal outcome worth showing, e.g. an unreachable peer
+	err  error
 }
 
 type openedMsg struct {
@@ -193,6 +204,40 @@ func (m model) scanCmd() tea.Cmd {
 			return scanDoneMsg{err: err}
 		}
 		store.ScanAll(ctx, cfg.Roots)
+		return scanDoneMsg{cfg: cfg}
+	}
+}
+
+// syncCmd pulls from every peer, then rescans — the same two steps the serve
+// daemon and `markroom sync` take. It reports through scanDoneMsg because,
+// from the inbox's point of view, the outcome is identical: a fresh config
+// and a fresh index.
+func (m model) syncCmd() tea.Cmd {
+	ctx, store := m.ctx, m.store
+	return func() tea.Msg {
+		cfg, err := config.Load()
+		if err != nil {
+			return scanDoneMsg{err: err}
+		}
+		cacheDir, err := config.CacheDir()
+		if err != nil {
+			return scanDoneMsg{err: err}
+		}
+		release, err := peer.Lock(cacheDir)
+		if err != nil {
+			return scanDoneMsg{err: err}
+		}
+		defer release()
+
+		s := &peer.Syncer{
+			Store: store, Client: peer.NewClient(),
+			CacheDir: cacheDir, SelfID: cfg.ServerID,
+		}
+		cfg, res := s.SyncAll(ctx, cfg)
+		store.ScanAll(ctx, cfg.Roots)
+		if len(res.Errors) > 0 {
+			return scanDoneMsg{cfg: cfg, note: "sync: " + res.Summary()}
+		}
 		return scanDoneMsg{cfg: cfg}
 	}
 }
@@ -273,7 +318,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.stats = msg.stats
 		items := make([]list.Item, len(msg.docs))
 		for i, d := range msg.docs {
-			items[i] = docItem{doc: d}
+			items[i] = docItem{doc: d, origin: m.originOf(d.Root)}
 		}
 		return m, m.list.SetItems(items)
 
@@ -283,6 +328,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.status = "rescan failed: " + msg.err.Error()
 			return m, nil
 		}
+		m.status = msg.note
 		m.cfg = msg.cfg
 		if m.rootIdx > len(m.cfg.Roots) {
 			m.rootIdx = 0

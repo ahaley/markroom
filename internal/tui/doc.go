@@ -64,8 +64,11 @@ func (m model) viewDoc() string {
 		return ""
 	}
 	title := titleStyle.Render(m.doc.Title)
-	meta := titleMetaStyle.Render(fmt.Sprintf("%s/%s · %s",
-		m.doc.Root, m.doc.RelPath, statusLabel(m.doc.Status)))
+	line := fmt.Sprintf("%s/%s · %s", m.doc.Root, m.doc.RelPath, statusLabel(m.doc.Status))
+	if origin := m.originOf(m.doc.Root); origin != "" {
+		line += " · from " + origin
+	}
+	meta := titleMetaStyle.Render(line)
 	footer := hintStyle.Render(fmt.Sprintf("%3.0f%% · esc back · u mark unread · ctrl+c quit",
 		m.vp.ScrollPercent()*100))
 	if m.status != "" {

@@ -31,6 +31,60 @@ func writeFile(t *testing.T, path, content string) {
 	}
 }
 
+func TestPeerState(t *testing.T) {
+	store := testStore(t)
+	ctx := t.Context()
+
+	states, err := store.PeerStates(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(states) != 0 {
+		t.Fatalf("fresh store has %d peer states", len(states))
+	}
+
+	now := time.Now().Truncate(time.Second)
+	want := PeerState{Peer: "laptop", ServerID: "id-one", LastTry: now, LastOK: now, ManifestETag: `"abc"`}
+	if err := store.SetPeerState(ctx, want); err != nil {
+		t.Fatal(err)
+	}
+	states, err = store.PeerStates(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := states["laptop"]
+	if got.ServerID != "id-one" || got.ManifestETag != `"abc"` || !got.LastOK.Equal(now) {
+		t.Errorf("state = %+v", got)
+	}
+	if !got.Synced() {
+		t.Error("a state with no error and a successful time should read as synced")
+	}
+
+	// A later failure records the error without losing when it last worked.
+	fail := want
+	fail.LastTry = now.Add(time.Minute)
+	fail.LastError = "connection refused"
+	if err := store.SetPeerState(ctx, fail); err != nil {
+		t.Fatal(err)
+	}
+	states, _ = store.PeerStates(ctx)
+	got = states["laptop"]
+	if got.LastError != "connection refused" || !got.LastOK.Equal(now) {
+		t.Errorf("after failure, state = %+v", got)
+	}
+	if got.Synced() {
+		t.Error("a state carrying an error should not read as synced")
+	}
+
+	if err := store.DeletePeerState(ctx, "laptop"); err != nil {
+		t.Fatal(err)
+	}
+	states, _ = store.PeerStates(ctx)
+	if _, ok := states["laptop"]; ok {
+		t.Error("peer state survived deletion")
+	}
+}
+
 func TestScanRootLifecycle(t *testing.T) {
 	store := testStore(t)
 	dir := t.TempDir()

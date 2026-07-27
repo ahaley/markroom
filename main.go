@@ -5,6 +5,8 @@
 //	markroom list                        show registered directories
 //	markroom serve [--addr host:port]    run the reading server
 //	markroom tui [--root <name>]         read in the terminal
+//	markroom peer add <url>              mirror another markroom's markdown
+//	markroom sync                        pull from every peer now
 package main
 
 import (
@@ -16,6 +18,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/ahaley/markroom/internal/config"
 	"github.com/ahaley/markroom/internal/index"
@@ -43,6 +46,10 @@ func main() {
 		err = cmdServe(ctx, os.Args[2:])
 	case "tui":
 		err = cmdTUI(ctx, os.Args[2:])
+	case "peer":
+		err = cmdPeer(ctx, os.Args[2:])
+	case "sync":
+		err = cmdSync(ctx, os.Args[2:])
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -67,8 +74,17 @@ usage:
                  [--allow-host h1,h2]  extra hostnames accepted by the server
                                        (localhost, the bound host, loopback IPs,
                                        and *.ts.net are always accepted)
+                 [--sync-every 5m]     how often to pull from peers (0 disables)
   markroom tui [--root <name>]         read in the terminal (optionally filtered
                                        to one root)
+
+peering — read another machine's markdown here, and keep reading it after
+that machine goes offline:
+  markroom peer add <url> [--name n]   mirror another markroom's markdown
+  markroom peer remove <name>          stop syncing (mirrored docs stay)
+                 [--purge]             …and delete what was mirrored
+  markroom peer list                   peers, last sync, and what they gave us
+  markroom sync [--peer <name>]        pull from peers now
 
 To read from your phone over Tailscale:
   tailscale serve --bg http://127.0.0.1:8383`)
@@ -110,7 +126,10 @@ func cmdAdd(ctx context.Context, args []string) error {
 	}
 	rootName := *name
 	if rootName == "" {
-		rootName = slugify(filepath.Base(abs))
+		rootName = config.Slugify(filepath.Base(abs))
+	}
+	if err := config.ValidRootName(rootName); err != nil {
+		return err
 	}
 
 	cfg, err := config.Load()
@@ -154,10 +173,17 @@ func cmdRemove(ctx context.Context, args []string) error {
 	}
 	kept := cfg.Roots[:0]
 	found := false
+	var removed config.Root
 	for _, r := range cfg.Roots {
 		if strings.EqualFold(r.Name, name) {
-			found = true
-			name = r.Name
+			// While the peer is still configured, removing its mirror here
+			// would only last until the next sync recreated it — the peer is
+			// what has to go. Once the peer is gone the mirror is an orphan,
+			// and removing it is exactly right.
+			if r.IsMirror() && cfg.FindPeer(r.ViaPeer) != nil {
+				return fmt.Errorf("%s is mirrored from peer %q — use: markroom peer remove %s [--purge]", r.Name, r.ViaPeer, r.ViaPeer)
+			}
+			found, name, removed = true, r.Name, r
 			continue
 		}
 		kept = append(kept, r)
@@ -168,6 +194,13 @@ func cmdRemove(ctx context.Context, args []string) error {
 	cfg.Roots = kept
 	if err := cfg.Save(); err != nil {
 		return err
+	}
+	// An orphaned mirror's files are markroom's own cache, so they go too;
+	// a local root's directory is the user's and is never touched.
+	if removed.IsMirror() {
+		if err := removeCached(removed.Path); err != nil {
+			return err
+		}
 	}
 	store, err := openStore()
 	if err != nil {
@@ -209,6 +242,7 @@ func cmdServe(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	addr := fs.String("addr", "127.0.0.1:8383", "listen address")
 	allow := fs.String("allow-host", "", "comma-separated extra hostnames to accept")
+	syncEvery := fs.Duration("sync-every", 5*time.Minute, "how often to pull from peers (0 disables)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -222,7 +256,12 @@ func cmdServe(ctx context.Context, args []string) error {
 		}
 	}
 
-	cfg, err := config.Load()
+	// Serving means being peerable, which requires a stable identity.
+	cfg, err := config.EnsureIdentity()
+	if err != nil {
+		return err
+	}
+	cacheDir, err := config.CacheDir()
 	if err != nil {
 		return err
 	}
@@ -232,7 +271,12 @@ func cmdServe(ctx context.Context, args []string) error {
 	}
 	defer store.Close()
 
-	return web.NewServer(store, cfg).Run(ctx, *addr, allowHosts)
+	return web.NewServer(store, cfg).Run(ctx, web.Options{
+		Addr:       *addr,
+		AllowHosts: allowHosts,
+		CacheDir:   cacheDir,
+		SyncEvery:  *syncEvery,
+	})
 }
 
 func cmdTUI(ctx context.Context, args []string) error {
@@ -268,21 +312,4 @@ func cmdTUI(ctx context.Context, args []string) error {
 	defer store.Close()
 
 	return tui.Run(ctx, store, cfg, *root)
-}
-
-func slugify(s string) string {
-	var b strings.Builder
-	for _, r := range strings.ToLower(s) {
-		switch {
-		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '-', r == '_':
-			b.WriteRune(r)
-		case r == ' ' || r == '.':
-			b.WriteRune('-')
-		}
-	}
-	out := strings.Trim(b.String(), "-")
-	if out == "" {
-		out = "root"
-	}
-	return out
 }

@@ -4,6 +4,7 @@
   <a class="brand" href="/">← markroom</a>
   <span class="docmeta">
     <a class="root" href="/?root={{.Doc.Root}}">{{.Doc.Root}}</a>
+    {{if .Origin}}<span class="origin" title="mirrored from {{.Origin}}">↗ {{.Origin}}</span>{{end}}
     <span class="path">{{.Doc.RelPath}}</span>
     <span class="dot">·</span> {{timeago .Doc.MTime}}
     <span class="dot">·</span> {{readmins .Doc.Words}} min

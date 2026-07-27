@@ -7,17 +7,19 @@
     {{if .Root}}<input type="hidden" name="root" value="{{.Root}}">{{end}}
   </form>
   <form action="/api/rescan" method="post"><button class="ghost" title="rescan roots">↻</button></form>
+  {{if .HasPeers}}<form action="/api/sync" method="post"><button class="ghost" title="pull from peers now">⇅</button></form>{{end}}
 </header>
 <main>
 {{if gt (len .Roots) 1}}
 <nav class="roots">
 {{range .Roots}}{{if eq .Name $.Root}}
-  <a class="pill active" href="{{if $.Query}}/?q={{$.Query}}{{else}}/{{end}}" title="clear root filter">{{.Name}}{{if .Unread}} <span class="count">{{.Unread}}</span>{{end}} <span class="x">×</span></a>
+  <a class="pill active{{if .Origin}} mirror{{end}}" href="{{if $.Query}}/?q={{$.Query}}{{else}}/{{end}}" title="clear root filter">{{.Name}}{{if .Unread}} <span class="count">{{.Unread}}</span>{{end}} <span class="x">×</span></a>
 {{else}}
-  <a class="pill" href="/?root={{.Name}}{{if $.Query}}&q={{$.Query}}{{end}}">{{.Name}}{{if .Unread}} <span class="count">{{.Unread}}</span>{{end}}</a>
+  <a class="pill{{if .Origin}} mirror{{end}}" href="/?root={{.Name}}{{if $.Query}}&q={{$.Query}}{{end}}"{{if .Origin}} title="mirrored from {{.Origin}}"{{end}}>{{.Name}}{{if .Unread}} <span class="count">{{.Unread}}</span>{{end}}</a>
 {{end}}{{end}}
 </nav>
 {{end}}
+{{if .Peers}}<p class="peerstatus">{{range .Peers}}{{.Name}} is not answering{{if not .Last.IsZero}} — showing what was mirrored {{timeago .Last}}{{end}}. {{end}}</p>{{end}}
 {{if .Query}}<p class="meta">{{len .Docs}} result(s) for “{{.Query}}”{{if .Root}} in {{.Root}}{{end}} — <a href="{{if .Root}}/?root={{.Root}}{{else}}/{{end}}">clear</a></p>
 {{else if .Root}}<p class="meta">{{len .Docs}} doc(s) in {{.Root}} — <a href="/">clear</a></p>{{end}}
 {{if not .Docs}}<p class="empty">{{if .Query}}Nothing matched.{{else if .Root}}Nothing in {{.Root}} yet.{{else}}Oh, hi Mark. Nothing indexed yet — register a directory with <code>markroom add &lt;dir&gt;</code>.{{end}}</p>{{end}}
@@ -32,6 +34,7 @@
       </span>
       <span class="row2">
         {{if not $.Root}}<span class="root">{{.Root}}</span>{{end}}
+        {{if .Origin}}<span class="origin" title="mirrored from {{.Origin}}">↗ {{.Origin}}</span>{{end}}
         <span class="path">{{.RelPath}}</span>
         <span class="dot">·</span> {{timeago .MTime}}
         <span class="dot">·</span> {{readmins .Words}} min

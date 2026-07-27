@@ -53,6 +53,11 @@ li.read .title{font-weight:400;color:var(--muted)}
 .row2{display:block;margin-top:.15rem;color:var(--muted);font-size:.82rem}
 .root{color:var(--accent);background:var(--accent-bg);padding:.05rem .4rem;
   border-radius:.35rem;font-size:.78rem}
+/* mirrored from another machine: dashed, to read as "held here, written elsewhere" */
+.origin{color:var(--muted);border:1px dashed var(--line);padding:.05rem .4rem;
+  border-radius:.35rem;font-size:.78rem;white-space:nowrap}
+.pill.mirror{border-style:dashed}
+.peerstatus{margin:.5rem 0 0;color:var(--updated);font-size:.82rem}
 .path{word-break:break-all}
 .dot{opacity:.5;margin:0 .15rem}
 .snippet{display:block;margin-top:.3rem;color:var(--muted);font-size:.88rem}

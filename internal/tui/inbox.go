@@ -25,8 +25,12 @@ var (
 	errStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
 )
 
-// docItem adapts an index.Doc to the bubbles list.
-type docItem struct{ doc index.Doc }
+// docItem adapts an index.Doc to the bubbles list. origin names the machine a
+// mirrored document was written on, and is empty for local roots.
+type docItem struct {
+	doc    index.Doc
+	origin string
+}
 
 // statusBadge marks unread work the way the web inbox does; read docs get
 // aligning whitespace instead of a glyph.
@@ -52,8 +56,12 @@ func (i docItem) Description() string {
 		s := strings.NewReplacer("<mark>", "", "</mark>", "", "\n", " ").Replace(i.doc.Snippet)
 		return "  " + s
 	}
-	return fmt.Sprintf("  %s/%s · %s · %d min read",
-		i.doc.Root, i.doc.RelPath, format.TimeAgo(i.doc.MTime), format.ReadMins(i.doc.Words))
+	origin := ""
+	if i.origin != "" {
+		origin = "↗" + i.origin + " "
+	}
+	return fmt.Sprintf("  %s%s/%s · %s · %d min read",
+		origin, i.doc.Root, i.doc.RelPath, format.TimeAgo(i.doc.MTime), format.ReadMins(i.doc.Words))
 }
 
 func (i docItem) FilterValue() string { return i.doc.Title + " " + i.doc.RelPath }
@@ -114,6 +122,12 @@ func (m model) updateInbox(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.scanning = true
 		return m, tea.Batch(m.scanCmd(), m.spin.Tick)
+	case "s":
+		if m.scanning || len(m.cfg.Peers) == 0 {
+			return m, nil
+		}
+		m.scanning = true
+		return m, tea.Batch(m.syncCmd(), m.spin.Tick)
 	case "enter":
 		if it, ok := m.list.SelectedItem().(docItem); ok {
 			return m, m.openCmd(it.doc)
@@ -173,7 +187,11 @@ func (m model) pillsView() string {
 	}
 	parts := []string{pill("all", totalUnread, m.rootIdx == 0)}
 	for i, rt := range m.cfg.Roots {
-		parts = append(parts, pill(rt.Name, m.stats[rt.Name].Unread, m.rootIdx == i+1))
+		label := rt.Name
+		if rt.IsMirror() {
+			label = "↗" + label // held here, written on another machine
+		}
+		parts = append(parts, pill(label, m.stats[rt.Name].Unread, m.rootIdx == i+1))
 	}
 	return lipgloss.JoinHorizontal(lipgloss.Center, parts...)
 }
@@ -192,5 +210,9 @@ func (m model) footerView() string {
 	if m.status != "" {
 		return errStyle.Render(m.status)
 	}
-	return hintStyle.Render("enter open · / search · tab root · r rescan · q quit")
+	hints := "enter open · / search · tab root · r rescan"
+	if len(m.cfg.Peers) > 0 {
+		hints += " · s sync"
+	}
+	return hintStyle.Render(hints + " · q quit")
 }

@@ -186,6 +186,44 @@ func TestRootFilter(t *testing.T) {
 	get(t, client, ts.URL+"/d/docs/spec.md", http.StatusOK, `<a class="root" href="/?root=docs">docs</a>`)
 }
 
+// Mirrored roots are named "<origin>:<root>", so the colon has to survive the
+// mux, the templates, and a round trip through the query string.
+func TestColonRootRouting(t *testing.T) {
+	store, err := index.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { store.Close() })
+	dir1, dir2 := t.TempDir(), t.TempDir()
+	cfg := &config.Config{Roots: []config.Root{
+		{Name: "docs", Path: dir1},
+		{Name: "laptop:notes", Path: dir2},
+	}}
+	srv := NewServer(store, cfg)
+	srv.reloadConfig = func() (*config.Config, error) { return cfg, nil }
+
+	writeFile(t, filepath.Join(dir1, "spec.md"), "# The Spec")
+	writeFile(t, filepath.Join(dir2, "mirrored.md"), "# Mirrored Doc\n\nfrom the laptop")
+	srv.reloadAndScan(t.Context())
+
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	client := ts.Client()
+
+	// html/template leaves the colon alone inside a path but percent-encodes
+	// it in a query (as lowercase %3a). Both forms have to route.
+	get(t, client, ts.URL+"/", http.StatusOK,
+		`href="/d/laptop:notes/mirrored.md"`, `href="/?root=laptop%3anotes"`)
+	get(t, client, ts.URL+"/d/laptop:notes/mirrored.md", http.StatusOK, "from the laptop")
+	get(t, client, ts.URL+"/d/laptop%3Anotes/mirrored.md", http.StatusOK, "from the laptop")
+
+	body := get(t, client, ts.URL+"/?root=laptop%3Anotes", http.StatusOK,
+		"Mirrored Doc", "pill active")
+	if strings.Contains(body, "The Spec") {
+		t.Error("colon-named root filter leaked another root's doc")
+	}
+}
+
 func TestHostGuard(t *testing.T) {
 	ok := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)

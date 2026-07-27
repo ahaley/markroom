@@ -68,7 +68,80 @@ CREATE TABLE IF NOT EXISTS read_state(
   read_at   INTEGER NOT NULL,
   hash_read TEXT NOT NULL
 );
-CREATE VIRTUAL TABLE IF NOT EXISTS docs_fts USING fts5(title, body);`)
+CREATE VIRTUAL TABLE IF NOT EXISTS docs_fts USING fts5(title, body);
+CREATE TABLE IF NOT EXISTS peer_state(
+  peer          TEXT PRIMARY KEY,
+  server_id     TEXT NOT NULL DEFAULT '',
+  last_try_at   INTEGER NOT NULL DEFAULT 0,
+  last_ok_at    INTEGER NOT NULL DEFAULT 0,
+  last_error    TEXT NOT NULL DEFAULT '',
+  manifest_etag TEXT NOT NULL DEFAULT ''
+);`)
+	return err
+}
+
+// PeerState is what we remember about the last conversation with a peer.
+// It lives here rather than in config.json because it changes on every sync
+// cycle, and a daemon rewriting the config that often would keep colliding
+// with whatever the operator is doing at the command line.
+type PeerState struct {
+	Peer         string
+	ServerID     string
+	LastTry      time.Time
+	LastOK       time.Time
+	LastError    string
+	ManifestETag string
+}
+
+// Synced reports whether the last attempt succeeded.
+func (p PeerState) Synced() bool { return p.LastError == "" && !p.LastOK.IsZero() }
+
+func (s *Store) PeerStates(ctx context.Context) (map[string]PeerState, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT peer, server_id, last_try_at, last_ok_at, last_error, manifest_etag FROM peer_state`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]PeerState{}
+	for rows.Next() {
+		var p PeerState
+		var try, ok int64
+		if err := rows.Scan(&p.Peer, &p.ServerID, &try, &ok, &p.LastError, &p.ManifestETag); err != nil {
+			return nil, err
+		}
+		if try > 0 {
+			p.LastTry = time.Unix(try, 0)
+		}
+		if ok > 0 {
+			p.LastOK = time.Unix(ok, 0)
+		}
+		out[p.Peer] = p
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) SetPeerState(ctx context.Context, p PeerState) error {
+	var try, ok int64
+	if !p.LastTry.IsZero() {
+		try = p.LastTry.Unix()
+	}
+	if !p.LastOK.IsZero() {
+		ok = p.LastOK.Unix()
+	}
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO peer_state(peer, server_id, last_try_at, last_ok_at, last_error, manifest_etag)
+VALUES(?,?,?,?,?,?)
+ON CONFLICT(peer) DO UPDATE SET
+  server_id=excluded.server_id, last_try_at=excluded.last_try_at,
+  last_ok_at=excluded.last_ok_at, last_error=excluded.last_error,
+  manifest_etag=excluded.manifest_etag`,
+		p.Peer, p.ServerID, try, ok, p.LastError, p.ManifestETag)
+	return err
+}
+
+func (s *Store) DeletePeerState(ctx context.Context, peer string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM peer_state WHERE peer=?`, peer)
 	return err
 }
 
@@ -89,6 +162,13 @@ type Doc struct {
 func IsMarkdown(name string) bool {
 	ext := strings.ToLower(filepath.Ext(name))
 	return ext == ".md" || ext == ".markdown"
+}
+
+// SkipDirName reports whether a walk should refuse to descend into a
+// directory of this name. Exported so anything else walking a root — the
+// peer manifest's asset listing, say — hides the same things the scanner does.
+func SkipDirName(name string) bool {
+	return strings.HasPrefix(name, ".") || skipDirs[strings.ToLower(name)]
 }
 
 // dbtx is the intersection of *sql.DB and *sql.Tx the write paths need, so
@@ -128,8 +208,7 @@ func scanRoot(ctx context.Context, q dbtx, root config.Root) (int, error) {
 			return nil // unreadable entry: skip, keep walking
 		}
 		if d.IsDir() {
-			name := d.Name()
-			if path != root.Path && (strings.HasPrefix(name, ".") || skipDirs[strings.ToLower(name)]) {
+			if path != root.Path && SkipDirName(d.Name()) {
 				return filepath.SkipDir
 			}
 			return nil
@@ -317,6 +396,58 @@ GROUP BY d.root`)
 		counts[name] = c
 	}
 	return counts, rows.Err()
+}
+
+// DocMeta is one document's catalog entry without its body — what a peer
+// needs to decide whether it already has the file.
+type DocMeta struct {
+	RelPath string
+	Title   string
+	Hash    string
+	MTime   int64
+	Size    int64
+	Words   int
+}
+
+// AllDocMeta returns every indexed document grouped by root, each group
+// ordered by path. One query serves a whole manifest.
+func (s *Store) AllDocMeta(ctx context.Context) (map[string][]DocMeta, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT root, relpath, title, hash, mtime, size, words FROM docs
+ORDER BY root, relpath`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string][]DocMeta{}
+	for rows.Next() {
+		var root string
+		var m DocMeta
+		if err := rows.Scan(&root, &m.RelPath, &m.Title, &m.Hash, &m.MTime, &m.Size, &m.Words); err != nil {
+			return nil, err
+		}
+		out[root] = append(out[root], m)
+	}
+	return out, rows.Err()
+}
+
+// DocHashes returns relpath -> content hash for one root, so a sync can tell
+// at a glance which of a peer's documents it is already holding.
+func (s *Store) DocHashes(ctx context.Context, rootName string) (map[string]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT relpath, hash FROM docs WHERE root=?`, rootName)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]string{}
+	for rows.Next() {
+		var rel, hash string
+		if err := rows.Scan(&rel, &hash); err != nil {
+			return nil, err
+		}
+		out[rel] = hash
+	}
+	return out, rows.Err()
 }
 
 const docStatusExpr = `CASE

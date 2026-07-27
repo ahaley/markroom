@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -27,6 +28,7 @@ import (
 
 	"github.com/ahaley/markroom/internal/config"
 	"github.com/ahaley/markroom/internal/index"
+	"github.com/ahaley/markroom/internal/peer"
 )
 
 // Extensions of non-markdown files we are willing to serve from a root,
@@ -62,6 +64,12 @@ type Server struct {
 	// reloadConfig refreshes the whitelist before a rescan; overridable in
 	// tests so handlers never touch the real user config.
 	reloadConfig func() (*config.Config, error)
+
+	// syncer mirrors peers' markdown. Nil when this server has no cache
+	// directory to mirror into, in which case peering is simply off.
+	syncer  *peer.Syncer
+	syncMu  sync.Mutex
+	syncing atomic.Bool
 }
 
 func NewServer(store *index.Store, cfg *config.Config) *Server {
@@ -70,13 +78,34 @@ func NewServer(store *index.Store, cfg *config.Config) *Server {
 	return s
 }
 
-// Run scans, keeps rescanning every 30 seconds, and serves until ctx is
-// canceled, then drains in-flight requests.
-func (s *Server) Run(ctx context.Context, addr string, allowHosts []string) error {
-	fmt.Println("markroom: initial scan…")
-	s.store.ScanAll(ctx, s.cfg.Load().Roots)
+// Options configures a running server.
+type Options struct {
+	Addr       string
+	AllowHosts []string
+	// CacheDir is where peers' markdown is mirrored. Empty disables peering.
+	CacheDir string
+	// SyncEvery is how often to pull from peers. Zero disables the timer;
+	// the sync button and `markroom sync` still work.
+	SyncEvery time.Duration
+}
 
-	// Periodic rescan keeps the index tracking whatever agents write.
+// Run scans, keeps rescanning every 30 seconds, pulls from peers on a slower
+// timer, and serves until ctx is canceled, then drains in-flight requests.
+func (s *Server) Run(ctx context.Context, opts Options) error {
+	cfg := s.cfg.Load()
+	if opts.CacheDir != "" && cfg.ServerID != "" {
+		s.syncer = &peer.Syncer{
+			Store: s.store, Client: peer.NewClient(),
+			CacheDir: opts.CacheDir, SelfID: cfg.ServerID,
+		}
+	}
+
+	fmt.Println("markroom: initial scan…")
+	s.store.ScanAll(ctx, cfg.Roots)
+
+	// Periodic rescan keeps the index tracking whatever agents write. It is
+	// deliberately local-only and fast; peers are pulled on their own, much
+	// slower timer so a sleeping laptop never slows the inbox down.
 	go func() {
 		t := time.NewTicker(30 * time.Second)
 		defer t.Stop()
@@ -90,15 +119,23 @@ func (s *Server) Run(ctx context.Context, addr string, allowHosts []string) erro
 		}
 	}()
 
+	if s.syncer != nil && opts.SyncEvery > 0 {
+		go s.syncLoop(ctx, opts.SyncEvery)
+	}
+
+	addr := opts.Addr
 	httpSrv := &http.Server{
 		Addr:              addr,
-		Handler:           hostGuard(addr, allowHosts, s.Handler()),
+		Handler:           hostGuard(addr, opts.AllowHosts, s.Handler()),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	errCh := make(chan error, 1)
 	go func() { errCh <- httpSrv.ListenAndServe() }()
 
 	fmt.Printf("markroom: oh, hi — reading at http://%s\n", addr)
+	if n := len(cfg.Peers); n > 0 {
+		fmt.Printf("markroom: mirroring %d peer(s) every %s\n", n, opts.SyncEvery)
+	}
 	fmt.Println("markroom: for your phone over Tailscale:  tailscale serve --bg http://" + addr)
 
 	select {
@@ -122,7 +159,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /d/{root}/{path...}", s.handleDoc)
 	mux.HandleFunc("POST /api/unread", s.handleUnread)
 	mux.HandleFunc("POST /api/rescan", s.handleRescan)
+	mux.HandleFunc("POST /api/sync", s.handleSync)
 	mux.HandleFunc("GET /app.css", s.handleCSS)
+	// The peer protocol: what another markroom reads to mirror this one.
+	mux.HandleFunc("GET "+peer.ManifestPath, s.handleManifest)
+	mux.HandleFunc("GET "+peer.RawPath+"{root}/{path...}", s.handleRaw)
 	return mux
 }
 
@@ -132,6 +173,39 @@ func (s *Server) reloadAndScan(ctx context.Context) {
 		s.cfg.Store(fresh)
 	}
 	s.store.ScanAll(ctx, s.cfg.Load().Roots)
+}
+
+// syncLoop pulls from peers on a timer, starting with one pass right away so
+// a freshly started server doesn't wait a full interval to catch up.
+func (s *Server) syncLoop(ctx context.Context, every time.Duration) {
+	s.syncNow(ctx)
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			s.syncNow(ctx)
+		}
+	}
+}
+
+// syncNow mirrors every peer and indexes whatever arrived. Peers that don't
+// answer are logged, never fatal — what is already cached stays readable.
+func (s *Server) syncNow(ctx context.Context) {
+	if s.syncer == nil {
+		return
+	}
+	s.syncMu.Lock()
+	defer s.syncMu.Unlock()
+	s.syncing.Store(true)
+	defer s.syncing.Store(false)
+
+	cfg, res := s.syncer.SyncAll(ctx, s.cfg.Load())
+	s.cfg.Store(cfg)
+	s.store.ScanAll(ctx, cfg.Roots)
+	slog.Info("peer sync", "result", res.Summary())
 }
 
 func (s *Server) handleInbox(w http.ResponseWriter, r *http.Request) {
@@ -162,25 +236,73 @@ func (s *Server) handleInbox(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	// Origin is a property of a root, so one pass over the config answers it
+	// for every row without touching the index.
+	origins := make(map[string]string, len(cfg.Roots))
 	pills := make([]rootPill, 0, len(cfg.Roots))
 	for _, rt := range cfg.Roots {
+		if rt.IsMirror() {
+			origins[rt.Name] = rt.OriginName
+		}
 		c := counts[rt.Name] // zero value keeps a pill for still-empty roots
-		pills = append(pills, rootPill{Name: rt.Name, Unread: c.Unread, Total: c.Total})
+		pills = append(pills, rootPill{
+			Name: rt.Name, Origin: origins[rt.Name], Unread: c.Unread, Total: c.Total,
+		})
+	}
+	rows := make([]docRow, 0, len(docs))
+	for _, d := range docs {
+		rows = append(rows, docRow{Doc: d, Origin: origins[d.Root]})
 	}
 
-	renderInbox(w, inboxData{Title: "markroom", Query: q, Root: root, Roots: pills, Docs: docs})
+	renderInbox(w, inboxData{
+		Title: "markroom", Query: q, Root: root,
+		Roots: pills, Docs: rows,
+		Peers: s.unhealthyPeers(r.Context(), cfg), HasPeers: len(cfg.Peers) > 0,
+	})
+}
+
+// unhealthyPeers lists peers whose last sync failed, so the inbox can say
+// "this machine isn't answering" rather than silently going stale.
+func (s *Server) unhealthyPeers(ctx context.Context, cfg *config.Config) []peerStatus {
+	if len(cfg.Peers) == 0 {
+		return nil
+	}
+	states, err := s.store.PeerStates(ctx)
+	if err != nil {
+		return nil
+	}
+	var out []peerStatus
+	for _, p := range cfg.Peers {
+		if st, ok := states[p.Name]; ok && st.LastError != "" {
+			out = append(out, peerStatus{Name: p.Name, Err: st.LastError, Last: st.LastOK})
+		}
+	}
+	return out
+}
+
+// errOutsideRoot means a request tried to escape the root it named.
+var errOutsideRoot = errors.New("path outside root")
+
+// resolveFile maps a root name and a URL sub-path onto an absolute path
+// inside that root. It is the containment guard the reading UI and the peer
+// protocol both depend on, so it lives in one place.
+func resolveFile(cfg *config.Config, rootName, subpath string) (root *config.Root, rel, full string, err error) {
+	root = cfg.Find(rootName)
+	if root == nil {
+		return nil, "", "", errOutsideRoot
+	}
+	rel = cleanSubpath(subpath)
+	full = filepath.Join(root.Path, filepath.FromSlash(rel))
+	inside, err := filepath.Rel(root.Path, full)
+	if err != nil || inside == ".." || strings.HasPrefix(inside, ".."+string(filepath.Separator)) {
+		return nil, "", "", errOutsideRoot
+	}
+	return root, rel, full, nil
 }
 
 func (s *Server) handleDoc(w http.ResponseWriter, r *http.Request) {
-	root := s.cfg.Load().Find(r.PathValue("root"))
-	if root == nil {
-		http.NotFound(w, r)
-		return
-	}
-	rel := cleanSubpath(r.PathValue("path"))
-	full := filepath.Join(root.Path, filepath.FromSlash(rel))
-	inside, err := filepath.Rel(root.Path, full)
-	if err != nil || inside == ".." || strings.HasPrefix(inside, ".."+string(filepath.Separator)) {
+	root, rel, full, err := resolveFile(s.cfg.Load(), r.PathValue("root"), r.PathValue("path"))
+	if err != nil {
 		http.NotFound(w, r)
 		return
 	}
@@ -220,7 +342,7 @@ func (s *Server) handleDoc(w http.ResponseWriter, r *http.Request) {
 	sum := sha256.Sum256(content)
 	_ = s.store.MarkRead(r.Context(), doc.ID, hex.EncodeToString(sum[:]))
 
-	renderDoc(w, doc, buf.String())
+	renderDoc(w, doc, buf.String(), root.OriginName)
 }
 
 func (s *Server) handleUnread(w http.ResponseWriter, r *http.Request) {
@@ -242,6 +364,18 @@ func (s *Server) handleUnread(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleRescan(w http.ResponseWriter, r *http.Request) {
 	s.reloadAndScan(r.Context())
+	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
+// handleSync pulls from every peer on demand. Unlike a rescan this reaches
+// across the network, so it gets its own budget and returns immediately if a
+// sync is already under way rather than queueing behind it.
+func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
+	if s.syncer != nil && !s.syncing.Load() {
+		ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+		defer cancel()
+		s.syncNow(ctx)
+	}
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
